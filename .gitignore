@@ -1,0 +1,160 @@
+# =============================================================================
+# Python — virtual environments
+# =============================================================================
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# =============================================================================
+# Python — compiled / cache
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# =============================================================================
+# Python — packaging & distribution
+# =============================================================================
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+sdist/
+*.spec
+MANIFEST
+
+# =============================================================================
+# Python — test / coverage
+# =============================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+nosetests.xml
+
+# =============================================================================
+# Python — type checkers / linters
+# =============================================================================
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+pyrightconfig.json
+
+# =============================================================================
+# Python — misc tools
+# =============================================================================
+pip-log.txt
+pip-delete-this-directory.txt
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# =============================================================================
+# Environment / secrets
+# =============================================================================
+.env
+.env.*
+!.env.example        # keep example env files committed
+!.env.*.example
+*.pem
+*.key
+*.cert
+*.p12
+
+# =============================================================================
+# Node / Frontend
+# =============================================================================
+node_modules/
+client/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.npm/
+
+# Vite / build output
+client/dist/
+dist/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# =============================================================================
+# IDEs & editors
+# =============================================================================
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# VS Code — only ignore user-specific files, not shared project settings
+.vscode/launch.json
+.vscode/tasks.json
+.vscode/*.code-snippets
+
+# =============================================================================
+# macOS / OS
+# =============================================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# =============================================================================
+# Docker
+# =============================================================================
+.docker/
+
+# =============================================================================
+# Logs & runtime files
+# =============================================================================
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+celerybeat-schedule
+celerybeat.pid
+
+# =============================================================================
+# Database / local storage
+# =============================================================================
+*.sqlite
+*.sqlite3
+*.db
+
+# =============================================================================
+# CrewAI / LLM artifacts
+# =============================================================================
+# CrewAI memory / knowledge-base files created at runtime
+.crewai/
+crew_memory/
+long_term_memory/
+
+# =============================================================================
+# Misc generated files
+# =============================================================================
+*.bak
+*.tmp
+*.orig
+.cache/

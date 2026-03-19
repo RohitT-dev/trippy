@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "crewai": "^1.0.1",
+    "immer": "^11.1.4"
+  }
+}
