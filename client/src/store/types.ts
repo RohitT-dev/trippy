@@ -65,7 +65,9 @@ export interface TravelState {
     | 'awaiting_user'
     | 'finalizing'
     | 'complete'
-    | 'error';
+    | 'error'
+    | 'stopped'
+    | 'stopping';
   current_step: string;
   error_message?: string;
   created_at: string;
@@ -109,6 +111,8 @@ export interface WebSocketMessage {
     | 'method_execution_finished'
     | 'flow_started'
     | 'flow_finished'
+    | 'flow_stopped'
+    | 'flow_error'
     | 'tool_usage_started'
     | 'tool_usage_finished'
     | string;

@@ -3,7 +3,7 @@
  * Handles API communication and state synchronization
  */
 
-import { useCallback } from 'react';
+import { useCallback, useRef, useLayoutEffect } from 'react';
 import { useTravelStore } from '../store/useTravelStore';
 import {
   PlanInitializeRequest,
@@ -32,6 +32,11 @@ const apiClient = axios.create({
 export const useTravelFlow = () => {
   const store = useTravelStore();
 
+  // Keep a ref to the latest store so the WebSocket message handler never
+  // goes stale and never needs to be in a useCallback dependency array.
+  const storeRef = useRef(store);
+  useLayoutEffect(() => { storeRef.current = store; });
+
   /** Start the planning flow asynchronously; returns the new session_id immediately. */
   const initializePlan = useCallback(async (data: {
     rough_dates: FuzzyDateRange;
@@ -39,6 +44,7 @@ export const useTravelFlow = () => {
     preferences: TravelPreferences;
     confirmed_dates?: ConfirmedDateRange;
   }) => {
+    store.setLastPlanRequest(data);
     try {
       const request: PlanInitializeRequest = {
         rough_dates: data.rough_dates,
@@ -91,6 +97,25 @@ export const useTravelFlow = () => {
     }
   }, [store]);
 
+  /** Stop the active flow for the current session. */
+  const stopFlow = useCallback(async (sessionId: string) => {
+    try {
+      store.setUIStatus('stopping');
+      await apiClient.post(`/api/plan/${sessionId}/stop`);
+    } catch (error) {
+      // If the server says 404 the flow already finished — treat as stopped
+      store.setUIStatus('stopped');
+    }
+  }, [store]);
+
+  /** Retry: reset local state and re-submit the last plan request. */
+  const retryFlow = useCallback(async () => {
+    const lastRequest = storeRef.current.lastPlanRequest;
+    if (!lastRequest) return;
+    store.reset();
+    await initializePlan(lastRequest);
+  }, [store, initializePlan]);
+
   const confirmDates = useCallback(async (sessionId: string) => {
     try {
       if (!store.confirmed_dates) {
@@ -123,117 +148,130 @@ export const useTravelFlow = () => {
   }, []);
 
   const handleWebSocketMessage = useCallback((message: WebSocketMessage) => {
+    const s = storeRef.current;
     // Filter by session_id when present so concurrent sessions don't cross-contaminate
     const msgSessionId = (message.data as any)?.session_id as string | undefined;
-    if (msgSessionId && store.session_id && msgSessionId !== store.session_id) return;
+    if (msgSessionId && s.session_id && msgSessionId !== s.session_id) return;
+
+    // Many CrewAI event broadcasts don't include a `data` field — guard against that.
+    const data = message.data ?? {};
 
     switch (message.type) {
       // ── Frontend-native message types ──────────────────────────────────
       case 'thought':
-        if (message.data.thought) store.addThought(message.data.thought);
+        if (data.thought) s.addThought(data.thought);
         break;
 
       case 'status_update':
-        if (message.data.status) store.setUIStatus(message.data.status as TravelState['ui_status']);
-        if (message.data.current_step) store.setCurrentStep(message.data.current_step);
+        if (data.status) s.setUIStatus(data.status as TravelState['ui_status']);
+        if (data.current_step) s.setCurrentStep(data.current_step);
         break;
 
       case 'flow_state_update':
-        if (message.data.ui_status) store.setUIStatus(message.data.ui_status as TravelState['ui_status']);
-        if (message.data.current_step) store.setCurrentStep(message.data.current_step);
+        if (data.ui_status) s.setUIStatus(data.ui_status as TravelState['ui_status']);
+        if (data.current_step) s.setCurrentStep(data.current_step);
         break;
 
       case 'itinerary_ready':
-        if (message.data.itinerary) {
-          store.setItinerary(message.data.itinerary);
+        if (data.itinerary) {
+          s.setItinerary(data.itinerary);
         }
         break;
 
       case 'human_feedback_requested': {
         const req: HumanFeedbackRequest = {
-          step: message.data.step as HumanFeedbackRequest['step'],
-          message: message.data.message,
-          options: message.data.options,
-          data: message.data,
-          session_id: message.data.session_id ?? store.session_id,
+          step: data.step as HumanFeedbackRequest['step'],
+          message: data.message,
+          options: data.options,
+          data: data,
+          session_id: data.session_id ?? s.session_id,
         };
-        store.setPendingFeedback(req);
+        s.setPendingFeedback(req);
         break;
       }
 
       case 'error':
-        if (message.data.error) {
-          store.setErrorMessage(message.data.error);
-          store.setUIStatus('error');
+      case 'flow_error':
+        if (data.error) {
+          s.setErrorMessage(data.error);
+          s.setUIStatus('error');
         }
         break;
 
       case 'state_sync':
-        if (message.data) store.loadState(message.data as TravelState);
+        if (message.data) s.loadState(message.data as TravelState);
         break;
 
       // ── CrewAI event types → map to agent thoughts ─────────────────────
       case 'crew_kickoff_started':
-        store.addThought(`🚀 Planning crew started`);
-        store.setUIStatus('researching');
+        s.addThought(`🚀 Planning crew started`);
+        s.setUIStatus('researching');
         break;
 
       case 'crew_kickoff_completed':
-        store.addThought(`✅ Planning crew finished`);
+        s.addThought(`✅ Planning crew finished`);
         break;
 
       case 'agent_execution_started': {
-        const agent = message.data.agent ?? 'Agent';
-        store.addThought(`🤖 ${agent}: starting…`);
+        const agent = data.agent ?? 'Agent';
+        s.addThought(`🤖 ${agent}: starting…`);
         break;
       }
 
       case 'agent_execution_completed': {
-        const agent = message.data.agent ?? 'Agent';
-        store.addThought(`✅ ${agent}: done`);
+        const agent = data.agent ?? 'Agent';
+        s.addThought(`✅ ${agent}: done`);
         break;
       }
 
       case 'task_started': {
-        const task = message.data.task ?? 'task';
-        store.addThought(`📋 Task started: ${task}`);
+        const task = data.task ?? 'task';
+        s.addThought(`📋 Task started: ${task}`);
         break;
       }
 
       case 'task_completed': {
-        const task = message.data.task ?? 'task';
-        store.addThought(`✅ Task completed: ${task}`);
+        const task = data.task ?? 'task';
+        s.addThought(`✅ Task completed: ${task}`);
         break;
       }
 
       case 'tool_usage_started': {
-        const tool = message.data.tool ?? 'tool';
-        store.addThought(`🔧 Using tool: ${tool}`);
+        const tool = data.tool ?? 'tool';
+        s.addThought(`🔧 Using tool: ${tool}`);
         break;
       }
 
       case 'tool_usage_finished': {
-        const tool = message.data.tool ?? 'tool';
-        store.addThought(`🔧 Tool done: ${tool}`);
+        const tool = data.tool ?? 'tool';
+        s.addThought(`🔧 Tool done: ${tool}`);
         break;
       }
 
       case 'method_execution_started': {
-        const method = message.data.method ?? '';
-        if (method) store.addThought(`⚙️ Flow step: ${method}`);
+        const method = data.method ?? '';
+        if (method) s.addThought(`⚙️ Flow step: ${method}`);
         break;
       }
 
+      case 'flow_stopped':
+        s.setUIStatus('stopped');
+        s.setCurrentStep('stopped');
+        s.setPendingFeedback(null);
+        break;
+
       case 'flow_finished':
-        store.setUIStatus('complete');
-        store.setCurrentStep('finalized');
+        s.setUIStatus('complete');
+        s.setCurrentStep('finalized');
         break;
 
       default:
         // Silently ignore unknown events
         break;
     }
-  }, [store]);
+  // storeRef.current is always up-to-date via useLayoutEffect — no deps needed.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return {
     // Current state
@@ -257,6 +295,8 @@ export const useTravelFlow = () => {
     initializePlan,
     confirmDates,
     submitFeedback,
+    stopFlow,
+    retryFlow,
     handleWebSocketMessage,
     fetchPlan,
   };

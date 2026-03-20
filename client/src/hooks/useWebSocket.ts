@@ -3,7 +3,7 @@
  * Handles connection, reconnection, message routing, and cleanup
  */
 
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useLayoutEffect } from 'react';
 import { WebSocketMessage } from '../store/types';
 
 interface UseWebSocketOptions {
@@ -32,6 +32,17 @@ export const useWebSocket = ({
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
   const isManuallyClosedRef = useRef(false);
 
+  // Keep callback refs up-to-date without triggering reconnects.
+  // Using useLayoutEffect ensures the refs are current before the next paint.
+  const onMessageRef = useRef(onMessage);
+  const onErrorRef = useRef(onError);
+  const onOpenRef = useRef(onOpen);
+  const onCloseRef = useRef(onClose);
+  useLayoutEffect(() => { onMessageRef.current = onMessage; });
+  useLayoutEffect(() => { onErrorRef.current = onError; });
+  useLayoutEffect(() => { onOpenRef.current = onOpen; });
+  useLayoutEffect(() => { onCloseRef.current = onClose; });
+
   const connect = useCallback(() => {
     if (webSocketRef.current?.readyState === WebSocket.OPEN) {
       return;
@@ -43,13 +54,13 @@ export const useWebSocket = ({
       webSocketRef.current.onopen = () => {
         console.log('WebSocket connected:', url);
         reconnectCountRef.current = 0;
-        onOpen?.();
+        onOpenRef.current?.();
       };
 
       webSocketRef.current.onmessage = (event: MessageEvent) => {
         try {
           const message: WebSocketMessage = JSON.parse(event.data);
-          onMessage?.(message);
+          onMessageRef.current?.(message);
         } catch (err) {
           console.error('Failed to parse WebSocket message:', err);
         }
@@ -57,12 +68,12 @@ export const useWebSocket = ({
 
       webSocketRef.current.onerror = (event: Event) => {
         console.error('WebSocket error:', event);
-        onError?.(event);
+        onErrorRef.current?.(event);
       };
 
       webSocketRef.current.onclose = () => {
         console.log('WebSocket disconnected');
-        onClose?.();
+        onCloseRef.current?.();
 
         // Attempt to reconnect if not manually closed
         if (!isManuallyClosedRef.current && reconnectCountRef.current < reconnectAttempts) {
@@ -77,9 +88,11 @@ export const useWebSocket = ({
       };
     } catch (err) {
       console.error('Failed to create WebSocket:', err);
-      onError?.(err as Event);
+      onErrorRef.current?.(err as Event);
     }
-  }, [url, onMessage, onError, onOpen, onClose, reconnectAttempts, reconnectDelay]);
+  // Only reconnect when the URL changes — callbacks are accessed via refs.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [url, reconnectAttempts, reconnectDelay]);
 
   const disconnect = useCallback(() => {
     isManuallyClosedRef.current = true;

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import uuid
 import asyncio
 import threading
+from datetime import datetime as _dt
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocketDisconnect, WebSocket, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,12 +33,14 @@ from src.callbacks import WebSocketStreamCallback
 # Import listeners package so the event listener registers with CrewAI's event bus
 import src.listeners as _listeners
 from src.listeners import connected_clients, set_main_loop
+from src.listeners.websocket_listener import broadcast
 # Import feedback module — patches builtins.input on first import
 import src.feedback as _feedback_mod
 
 # Registry of in-flight flows keyed by session_id so the feedback endpoint
 # can mutate flow.state (e.g. confirmed_dates) before unblocking the thread.
 _active_flows: dict[str, TravelPlannerFlow] = {}
+_stopped_sessions: set[str] = set()   # sessions the user requested to stop
 _flows_lock = threading.Lock()
 
 # Configure logging
@@ -179,11 +182,27 @@ async def kickoff_flow(request: PlanInitializeRequest):
         try:
             flow.kickoff()
         except Exception as exc:
-            logger.error("Flow kickoff error: %s", exc)
+            # Don't broadcast an error if the user explicitly stopped the flow
+            with _flows_lock:
+                was_stopped = session_id in _stopped_sessions
+            if was_stopped:
+                logger.info("Flow stopped by user for session %s", session_id)
+            else:
+                logger.error("Flow kickoff error: %s", exc, exc_info=True)
+                broadcast({
+                    "type": "flow_error",
+                    "session_id": session_id,
+                    "data": {
+                        "error": str(exc),
+                        "session_id": session_id,
+                    },
+                    "timestamp": _dt.utcnow().isoformat(),
+                })
         finally:
             _feedback_mod.cleanup_session(session_id)
             with _flows_lock:
                 _active_flows.pop(session_id, None)
+                _stopped_sessions.discard(session_id)
 
     thread = threading.Thread(target=_run, daemon=True, name=f"flow-{session_id[:8]}")
     thread.start()
@@ -300,7 +319,32 @@ async def submit_human_feedback(session_id: str, body: FeedbackSubmission):
     return {"status": "accepted", "session_id": session_id}
 
 
-@app.post("/api/plan/{session_id}/confirm")
+@app.post("/api/plan/{session_id}/stop")
+async def stop_flow(session_id: str):
+    """Request cancellation of an in-flight planning flow.
+
+    Marks the session as stopped and unblocks any pending human-feedback
+    wait so the background thread exits cleanly.  A `flow_stopped` event
+    is broadcast so the frontend can update its UI immediately.
+    """
+    with _flows_lock:
+        is_active = session_id in _active_flows
+        _stopped_sessions.add(session_id)
+
+    if not is_active:
+        raise HTTPException(status_code=404, detail="No active flow for this session.")
+
+    # Unblock any human_feedback wait so the thread can exit
+    _feedback_mod.submit_feedback(session_id, "__stop__")
+
+    broadcast({
+        "type": "flow_stopped",
+        "session_id": session_id,
+        "data": {"session_id": session_id, "message": "Flow stopped by user."},
+        "timestamp": _dt.utcnow().isoformat(),
+    })
+    logger.info("Stop requested for session %s", session_id)
+    return {"status": "stopping", "session_id": session_id}
 async def confirm_dates(session_id: str, request: PlanConfirmRequest):
     """Confirm refined dates for a travel plan"""
     try:

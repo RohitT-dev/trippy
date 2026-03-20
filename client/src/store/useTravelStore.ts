@@ -27,6 +27,13 @@ const DEFAULT_PREFERENCES: TravelPreferences = {
 interface TravelStore extends TravelState {
   // Human-feedback overlay
   pendingFeedback: HumanFeedbackRequest | null;
+  // Last plan request — used by retryFlow to re-submit without re-filling the form
+  lastPlanRequest: {
+    rough_dates: FuzzyDateRange;
+    destinations: DestinationInput[];
+    preferences: TravelPreferences;
+    confirmed_dates?: ConfirmedDateRange;
+  } | null;
   // Actions
   setSessionId: (id: string) => void;
   setUserId: (id: string) => void;
@@ -44,6 +51,7 @@ interface TravelStore extends TravelState {
   clearThoughts: () => void;
   loadState: (state: TravelState) => void;
   setPendingFeedback: (req: HumanFeedbackRequest | null) => void;
+  setLastPlanRequest: (req: TravelStore['lastPlanRequest']) => void;
   reset: () => void;
 }
 
@@ -72,6 +80,7 @@ export const useTravelStore = create<TravelStore>()(
   immer((set) => ({
     ...createInitialState(),
     pendingFeedback: null,
+    lastPlanRequest: null,
 
     setSessionId: (id: string) =>
       set((state) => {
@@ -168,6 +177,11 @@ export const useTravelStore = create<TravelStore>()(
         state.pendingFeedback = req;
       }),
 
-    reset: () => set({ ...createInitialState(), pendingFeedback: null }),
+    setLastPlanRequest: (req) =>
+      set((state) => {
+        state.lastPlanRequest = req;
+      }),
+
+    reset: () => set({ ...createInitialState(), pendingFeedback: null, lastPlanRequest: null }),
   }))
 );

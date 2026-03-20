@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from pathlib import Path
@@ -12,28 +13,29 @@ from crewai_tools import SerperDevTool, ScrapeWebsiteTool
 # Load .env from the server directory (one level up from src/tools/)
 load_dotenv(Path(__file__).parents[2] / ".env")
 
-# ── Shared search + scrape instances ──────────────────────────────────
-_serper: SerperDevTool | None = None
-_scraper: ScrapeWebsiteTool | None = None
+# ── Per-thread search + scrape instances ──────────────────────────────
+# Using thread-local storage so each parallel worker thread gets its own
+# SerperDevTool / ScrapeWebsiteTool instance.  Sharing a single instance
+# across threads causes concurrent .run() calls to corrupt each other's state.
+_local = threading.local()
 
 
 def _get_serper() -> SerperDevTool | None:
-    global _serper
-    if _serper is None:
+    if not hasattr(_local, "serper"):
         if not os.getenv("SERPER_API_KEY", ""):
-            return None
-        try:
-            _serper = SerperDevTool(n_results=3)
-        except Exception:
-            return None
-    return _serper
+            _local.serper = None
+        else:
+            try:
+                _local.serper = SerperDevTool(n_results=3)
+            except Exception:
+                _local.serper = None
+    return _local.serper
 
 
 def _get_scraper() -> ScrapeWebsiteTool:
-    global _scraper
-    if _scraper is None:
-        _scraper = ScrapeWebsiteTool()
-    return _scraper
+    if not hasattr(_local, "scraper"):
+        _local.scraper = ScrapeWebsiteTool()
+    return _local.scraper
 
 
 def _search_and_scrape(query: str, max_pages: int = 2) -> str:

@@ -27,16 +27,18 @@ const STEP_CONFIG: Record<
   date_confirmation: {
     icon: '📅',
     approveLabel: 'Confirm Dates',
-    approveText: 'approve, the dates look good',
+    // Must match exact CrewAI emit outcome strings so _collapse_to_outcome
+    // can resolve instantly without an LLM round-trip.
+    approveText: 'dates_confirmed',
     rejectLabel: 'Request Different Dates',
-    rejectText: 'please suggest different dates',
+    rejectText: 'dates_rejected',
   },
   itinerary_review: {
     icon: '🗺️',
     approveLabel: 'Approve Itinerary',
-    approveText: 'approve, the itinerary looks great',
+    approveText: 'finalize',
     rejectLabel: 'Request Changes',
-    rejectText: 'please revise the itinerary',
+    rejectText: 'needs_revision',
   },
 };
 
@@ -127,7 +129,9 @@ export const HumanFeedbackCard = ({ feedback, onSubmit }: Props) => {
         {selectedIdx !== null && (
           <button
             onClick={() => handleSubmit(
-              `approve option ${selectedIdx + 1}: ${options[selectedIdx].start} to ${options[selectedIdx].end}`,
+              // Send the exact emit outcome string so the backend resolves
+              // it instantly without an LLM classification round-trip.
+              'dates_confirmed',
               options[selectedIdx],
             )}
             disabled={loading}

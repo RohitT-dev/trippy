@@ -101,9 +101,36 @@ export const PlannerPage = () => {
               </div>
             )}
 
-            {flow.error && (
+            {/* Stop button — visible while the flow is actively running */}
+            {flow.sessionId && (['researching', 'awaiting_date_confirmation', 'awaiting_itinerary_confirmation', 'awaiting_user'] as const).includes(flow.status as any) && (
+              <div className="flex justify-end">
+                <button
+                  onClick={() => flow.stopFlow(flow.sessionId!)}
+                  disabled={flow.status === 'stopping' as any}
+                  className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  ⛔ Stop Planning
+                </button>
+              </div>
+            )}
+
+            {/* Error / stopped banner with Retry option */}
+            {(flow.status === 'error' || flow.status === 'stopped' as any) && (
               <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-800">
-                Error: {flow.error}
+                <p className="font-medium">
+                  {flow.status === 'stopped'
+                    ? '⛔ Planning was stopped.'
+                    : `❌ Error: ${flow.error ?? 'Something went wrong'}`}
+                </p>
+                <p className="text-sm mt-1 text-red-600">You can retry with the same inputs or go back and change them.</p>
+                <div className="flex gap-3 mt-3">
+                  <button
+                    onClick={() => flow.retryFlow()}
+                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm"
+                  >
+                    🔄 Retry
+                  </button>
+                </div>
               </div>
             )}
 
