@@ -1,57 +1,63 @@
-# Trippy — CrewAI Flow Architecture Report
+# Trippy — CrewAI Flow Architecture
 
-> **Stack:** FastAPI · CrewAI Flows · Ollama (ministral-3:8b) · WebSocket · React/Vite/TypeScript/Tailwind
+> **Stack:** FastAPI · CrewAI 1.11.0 Flows · Ollama · WebSocket · React / Vite / TypeScript / Tailwind
 
 ---
 
 ## Table of Contents
+
 1. [High-Level Overview](#1-high-level-overview)
 2. [State Machine](#2-state-machine)
 3. [Flow Diagram](#3-flow-diagram)
 4. [Step-by-Step Walkthrough](#4-step-by-step-walkthrough)
 5. [Crew Architecture](#5-crew-architecture)
-6. [Human Feedback System](#6-human-feedback-system)
-7. [Date Option Selection](#7-date-option-selection)
-8. [Real-Time Event Pipeline](#8-real-time-event-pipeline)
-9. [Data Model — TravelState](#9-data-model--travelstate)
-10. [API Entry Points](#10-api-entry-points)
-11. [Key Design Decisions](#11-key-design-decisions)
+6. [Multi-Destination Parallelism](#6-multi-destination-parallelism)
+7. [Human Feedback System](#7-human-feedback-system)
+8. [Date Analysis Pipeline](#8-date-analysis-pipeline)
+9. [Stop & Retry](#9-stop--retry)
+10. [Real-Time Event Pipeline](#10-real-time-event-pipeline)
+11. [Data Model — TravelState](#11-data-model--travelstate)
+12. [API Reference](#12-api-reference)
+13. [Key Design Decisions](#13-key-design-decisions)
 
 ---
 
 ## 1. High-Level Overview
 
 ```
-Browser (React/TypeScript)
-    │  POST /api/events/kickoff  ──►  FastAPI (main.py)
-    │                                     │
-    │  WS  /ws/events  ◄── events ────────┤
-    │                                     │
-    │  POST /api/plan/{id}/feedback ──►   │
-    │                                     ▼
-    │                           Background Thread
-    │                           TravelPlannerFlow.kickoff()
-    │                                     │
-    │                          CrewAI Flow State Machine
-    │                    (6 steps · 3 Crews · 2 human checkpoints)
+Browser (React / TypeScript)
+    │  POST /api/events/kickoff       ──►  FastAPI (main.py)
+    │  POST /api/plan/{id}/feedback   ──►       │
+    │  POST /api/plan/{id}/stop       ──►       │
+    │  WS   /ws/events  ◄── all events ─────────┤
+    │                                           ▼
+    │                               Background daemon thread
+    │                               TravelPlannerFlow.kickoff()
+    │                                           │
+    │                              CrewAI Flow State Machine
+    │                      7 steps · 4 Crews · 2 human checkpoints
+    │                      multi-destination parallel execution
 ```
 
-The backend runs a **CrewAI `Flow`** inside a **background thread** so FastAPI's async event loop is never blocked. All progress streams to the browser over a single **WebSocket** at `/ws/events`.
+The backend runs a **CrewAI `Flow`** in a **background daemon thread** so FastAPI's asyncio event loop is never blocked. All progress — agent thoughts, tool calls, state changes, human checkpoints — streams to the browser over a shared **WebSocket** at `/ws/events`.
 
 ---
 
 ## 2. State Machine
 
-`TravelState` (a `FlowState` subclass) holds all data and drives the UI status indicator.
+`TravelState` (a `FlowState` subclass) carries all data and drives the frontend status indicator via `ui_status`.
 
-| `ui_status` value | Meaning |
+| `ui_status` | Meaning |
 |---|---|
 | `pending` | Session created, flow not yet started |
 | `researching` | Flow is actively running crews |
-| `awaiting_date_confirmation` | Blocked — waiting for human date selection/approval |
+| `awaiting_date_confirmation` | Blocked — waiting for human date selection / approval |
 | `awaiting_itinerary_confirmation` | Blocked — waiting for human itinerary review |
 | `awaiting_user` | Itinerary compiled, ready to display |
+| `finalizing` | Flow progressing to completion |
 | `complete` | Trip plan finalized |
+| `stopping` | Stop was requested, thread draining |
+| `stopped` | Flow halted by user before completion |
 | `error` | Unrecoverable error |
 
 ---
@@ -59,112 +65,127 @@ The backend runs a **CrewAI `Flow`** inside a **background thread** so FastAPI's
 ## 3. Flow Diagram
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                         TravelPlannerFlow                              │
-│                                                                        │
-│  ┌──────────────────┐                                                  │
-│  │  @start()        │                                                  │
-│  │ initialize_flow  │  Sets ui_status="researching"                    │
-│  └────────┬─────────┘                                                  │
-│           │ @listen(initialize_flow)                                   │
-│           ▼                                                            │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  analyze_travel_dates                                    │          │
-│  │                                                          │          │
-│  │  confirmed_dates already set?                            │          │
-│  │    YES ──► skip crew, return immediately                 │          │
-│  │    NO  ──► TravelCrews.date_scouting_crew().kickoff()    │          │
-│  │              Date Scout Agent (max_iter=2):              │          │
-│  │              ├─ analyze_fuzzy_dates                      │          │
-│  │              ├─ check_travel_seasons                     │          │
-│  │              └─ get_flight_availability                  │          │
-│  │                                                          │          │
-│  │  Rough dates? → parse 3-4 options                        │          │
-│  │  Exact dates? → parse single ConfirmedDateRange          │          │
-│  └────────────────────────┬─────────────────────────────────┘          │
-│           │                                                             │
-│           │ @listen(analyze_travel_dates)                               │
-│           │ @human_feedback(emit=["dates_confirmed","dates_rejected"])   │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  check_date_confirmation   🛑 HUMAN CHECKPOINT 1          │          │
-│  │                                                          │          │
-│  │  1. ui_status = "awaiting_date_confirmation"             │          │
-│  │  2. broadcast("human_feedback_requested") with           │          │
-│  │     proposed_options[] (if rough dates)  ──────────────►│──► WS   │
-│  │  3. _request_human_feedback() override blocks thread     │          │
-│  │     via wait_for_feedback(session_id)                    │          │
-│  │  4. waits for POST /api/plan/{id}/feedback               │          │
-│  │     (10-min timeout → default "approve")                 │          │
-│  │                                                          │          │
-│  │  If selected_dates in body → apply to flow.state first   │          │
-│  │  Ollama classifies response text:                        │          │
-│  │    "dates_confirmed" ──────────────────────────────────┐ │          │
-│  │    "dates_rejected"  (flow stops)                      │ │          │
-│  └────────────────────────────────────────────────────────┼─┘          │
-│                         @listen("dates_confirmed")         │            │
-│                                                            ▼            │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  research_destinations                                   │          │
-│  │                                                          │          │
-│  │  TravelCrews.destination_research_crew().kickoff()       │          │
-│  │    Destination Expert Agent (max_iter=2):                │          │
-│  │    ├─ research_destination (origin_country, group_size,  │          │
-│  │    │    theme, budget, pace)                             │          │
-│  │    ├─ get_visa_requirements (origin_country → dest)      │          │
-│  │    └─ find_accommodations (group_size, pace, budget)     │          │
-│  │                                                          │          │
-│  │  → state.agent_outputs["destination_research"]           │          │
-│  └────────────────────────┬─────────────────────────────────┘          │
-│           │ @listen(research_destinations)                              │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  plan_logistics                                          │          │
-│  │                                                          │          │
-│  │  TravelCrews.logistics_crew().kickoff()                  │          │
-│  │    Logistics Manager Agent (max_iter=2):                 │          │
-│  │    ├─ plan_transportation (origin_country, group_size)   │          │
-│  │    ├─ estimate_budget_breakdown (group_size)             │          │
-│  │    ├─ create_daily_itinerary (pace, theme, group)        │          │
-│  │    └─ check_travel_insurance (origin_country)            │          │
-│  │                                                          │          │
-│  │  → state.agent_outputs["logistics_plan"]                 │          │
-│  └────────────────────────┬─────────────────────────────────┘          │
-│           │ @listen(plan_logistics)                                     │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  compile_itinerary   (pure Python — no LLM)              │          │
-│  │                                                          │          │
-│  │  ├─ regex "Day N" blocks → activities per day            │          │
-│  │  ├─ extract $ budget estimate                            │          │
-│  │  ├─ extract key logistics lines (visa/flight/hotel...)   │          │
-│  │  └─ build Itinerary pydantic object                      │          │
-│  │                                                          │          │
-│  │  broadcast("itinerary_ready")  ────────────────────────►│──► WS   │
-│  └────────────────────────┬─────────────────────────────────┘          │
-│           │                             ◄──── loops back on revision   │
-│           │ @listen(or_(compile_itinerary, "needs_revision"))           │
-│           │ @human_feedback(emit=["finalize","needs_revision"])         │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  check_user_confirmation   🛑 HUMAN CHECKPOINT 2          │          │
-│  │                                                          │          │
-│  │  1. ui_status = "awaiting_itinerary_confirmation"        │          │
-│  │  2. broadcast("human_feedback_requested")  ────────────►│──► WS   │
-│  │  3. wait_for_feedback(session_id) blocks thread          │          │
-│  │                                                          │          │
-│  │  Ollama classifies response:                             │          │
-│  │    "finalize"        ──────────────────────────────────┐ │          │
-│  │    "needs_revision"  ──► loops back to this step       │ │          │
-│  └────────────────────────────────────────────────────────┼─┘          │
-│                                  @listen("finalize")       │            │
-│                                                            ▼            │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  finalize_trip                                           │          │
-│  │  ui_status = "complete"                                  │          │
-│  │  broadcast("flow_state_update")  ──────────────────────►│──► WS   │
-│  └──────────────────────────────────────────────────────────┘          │
-└────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           TravelPlannerFlow                              │
+│                                                                          │
+│  ┌──────────────────┐                                                    │
+│  │  @start()        │  ui_status = "researching"                         │
+│  │ initialize_flow  │  current_step = "analyzing_dates"                  │
+│  └────────┬─────────┘                                                    │
+│           │ @listen(initialize_flow)                                     │
+│           ▼                                                              │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │  analyze_travel_dates                                        │        │
+│  │                                                              │        │
+│  │  confirmed_dates already set?                                │        │
+│  │    YES ──► skip all crews, return immediately                │        │
+│  │    NO  ──►                                                   │        │
+│  │      For each destination (in PARALLEL):                     │        │
+│  │        date_scouting_crew.kickoff_for_each_async()           │        │
+│  │          Date Scout Agent (max_iter=1):                      │        │
+│  │          ├─ analyze_fuzzy_dates                              │        │
+│  │          ├─ check_travel_seasons                             │        │
+│  │          └─ get_flight_availability                          │        │
+│  │                                                              │        │
+│  │      Rough dates?                                            │        │
+│  │        → parse per-destination Option N: blocks             │        │
+│  │        → date_synthesis_crew.kickoff()                       │        │
+│  │            Date Synthesizer (no tools, max_iter=1):          │        │
+│  │            combines all reports → 4 cross-dest windows       │        │
+│  │        → _find_cross_destination_windows() fallback          │        │
+│  │          (window intersection + sliding-window generator)    │        │
+│  │      Exact dates?                                            │        │
+│  │        → parse per-destination ConfirmedDateRange            │        │
+│  │                                                              │        │
+│  │  state.proposed_date_options = [up to 4 ConfirmedDateRange] │        │
+│  │  state.confirmed_dates       = options[0]  (default)         │        │
+│  └────────────────────────┬─────────────────────────────────────┘        │
+│           │                                                               │
+│           │ @listen(analyze_travel_dates)                                 │
+│           │ @human_feedback(emit=["dates_confirmed","dates_rejected"])    │
+│           ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │  check_date_confirmation   🛑 HUMAN CHECKPOINT 1              │        │
+│  │                                                              │        │
+│  │  1. ui_status = "awaiting_date_confirmation"                 │        │
+│  │  2. broadcast("human_feedback_requested")  ─────────────────┼──► WS  │
+│  │     data: { proposed_options[], destinations[], is_rough }   │        │
+│  │  3. _request_human_feedback() override blocks thread         │        │
+│  │     via wait_for_feedback(session_id, timeout=600s)          │        │
+│  │                                                              │        │
+│  │  POST /api/plan/{id}/feedback unblocks the queue:            │        │
+│  │    selected_dates? → flow.state.confirmed_dates updated first│        │
+│  │    _collapse_to_outcome() bypass (no extra LLM round-trip):  │        │
+│  │      "dates_confirmed" ───────────────────────────────────┐  │        │
+│  │      "dates_rejected"  (flow terminates)                  │  │        │
+│  └───────────────────────────────────────────────────────────┼──┘        │
+│                          @listen("dates_confirmed")           │           │
+│                                                               ▼           │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │  research_destinations                                       │        │
+│  │                                                              │        │
+│  │  For each destination (in PARALLEL):                         │        │
+│  │    destination_research_crew.kickoff_for_each_async()        │        │
+│  │      Destination Expert Agent (max_iter=1):                  │        │
+│  │      ├─ research_destination  (theme, budget, pace, origin)  │        │
+│  │      ├─ get_visa_requirements (origin_country → destination) │        │
+│  │      └─ find_accommodations   (group_size, pace, budget)     │        │
+│  │                                                              │        │
+│  │  Sections combined: "## Dest\n\nresult\n\n---\n\n## Dest2…" │        │
+│  │  → state.agent_outputs["destination_research"]               │        │
+│  └────────────────────────┬─────────────────────────────────────┘        │
+│           │ @listen(research_destinations)                                │
+│           ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │  plan_logistics                                              │        │
+│  │                                                              │        │
+│  │  logistics_crew.kickoff()                                    │        │
+│  │    Logistics Manager Agent (max_iter=1):                     │        │
+│  │    ├─ plan_transportation      (origin_country, group_size)  │        │
+│  │    ├─ estimate_budget_breakdown (group_size)                 │        │
+│  │    ├─ create_daily_itinerary   (pace, theme, group)          │        │
+│  │    └─ check_travel_insurance   (origin_country)              │        │
+│  │                                                              │        │
+│  │  Context includes per-destination day schedule:              │        │
+│  │    "Days 1–3: Paris (3 days)\nDays 4–6: Rome (3 days)…"     │        │
+│  │  → state.agent_outputs["logistics_plan"]                     │        │
+│  └────────────────────────┬─────────────────────────────────────┘        │
+│           │ @listen(plan_logistics)                                       │
+│           ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │  compile_itinerary   (pure Python — no LLM)                  │        │
+│  │                                                              │        │
+│  │  ├─ regex "Day N — Destination" blocks → activities per day  │        │
+│  │  ├─ _dest_for_day(n) assigns destination by even split       │        │
+│  │  ├─ extract $ budget estimate                                │        │
+│  │  ├─ keyword-scan key logistics (visa/flight/hotel/insurance) │        │
+│  │  └─ build Itinerary pydantic object → state.itinerary        │        │
+│  │                                                              │        │
+│  │  broadcast("itinerary_ready")  ─────────────────────────────┼──► WS  │
+│  └────────────────────────┬─────────────────────────────────────┘        │
+│           │            ◄──── loops back on "needs_revision"               │
+│           │ @listen(or_(compile_itinerary, "needs_revision"))             │
+│           │ @human_feedback(emit=["finalize","needs_revision"])           │
+│           ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │  check_user_confirmation   🛑 HUMAN CHECKPOINT 2              │        │
+│  │                                                              │        │
+│  │  1. ui_status = "awaiting_itinerary_confirmation"            │        │
+│  │  2. broadcast("human_feedback_requested")  ─────────────────┼──► WS  │
+│  │  3. wait_for_feedback() blocks thread                        │        │
+│  │                                                              │        │
+│  │  _collapse_to_outcome() bypass:                              │        │
+│  │    "finalize"       ──────────────────────────────────────┐  │        │
+│  │    "needs_revision" ──► re-triggers this step (loop)      │  │        │
+│  └───────────────────────────────────────────────────────────┼──┘        │
+│                              @listen("finalize")              │           │
+│                                                               ▼           │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │  finalize_trip                                               │        │
+│  │  ui_status = "complete"                                      │        │
+│  │  broadcast("flow_state_update")  ───────────────────────────┼──► WS  │
+│  └──────────────────────────────────────────────────────────────┘        │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -174,61 +195,96 @@ The backend runs a **CrewAI `Flow`** inside a **background thread** so FastAPI's
 ### Step 0 — Session Kickoff (`POST /api/events/kickoff`)
 
 1. FastAPI creates a UUID `session_id` and a `TravelState` from the request body.
-2. `feedback_mod.register_session(session_id)` pre-creates a `queue.Queue(maxsize=1)`.
-3. The live `TravelPlannerFlow` instance is stored in `_active_flows[session_id]` so the feedback endpoint can mutate `flow.state` later.
-4. A **daemon thread** is spawned. Inside it: `set_thread_session` stores the session ID in thread-local storage (fallback for non-flow threads), then `flow.kickoff()` is called synchronously.
-5. The thread's `finally` block always calls `cleanup_session` and removes the flow from `_active_flows`.
+2. `feedback_mod.register_session(session_id)` pre-creates a `queue.Queue(maxsize=1)` **before** the thread starts — the overridden `_request_human_feedback()` needs the slot ready immediately.
+3. The live `TravelPlannerFlow` is stored in `_active_flows[session_id]` (protected by `threading.Lock`) so the feedback endpoint can mutate `flow.state.confirmed_dates` before unblocking the thread.
+4. A **daemon thread** spawns. Inside: `set_thread_session(session_id)` stores the ID in thread-local storage, then `flow.kickoff()` blocks synchronously until the full flow completes.
+5. The thread's `finally` block calls `cleanup_session`, removes the flow from `_active_flows`, and discards the session from `_stopped_sessions`.
 6. FastAPI immediately returns `{"status": "started", "session_id": "..."}` — fully non-blocking.
 
 ---
 
 ### Step 1 — `initialize_flow` (`@start`)
 
-- Sets `ui_status = "researching"`, `current_step = "analyzing_dates"`.
-- No crew or LLM work — purely state mutation.
+Sets `ui_status = "researching"` and `current_step = "analyzing_dates"`. No crew or LLM work.
 
 ---
 
 ### Step 1a — `analyze_travel_dates` (`@listen(initialize_flow)`)
 
-**Short-circuit:** If `confirmed_dates` already has a value (user provided exact ISO dates in the form), the crew is skipped entirely.
+**Short-circuit:** If `confirmed_dates` is already set (user supplied exact ISO dates), all crews are skipped.
 
-**Normal path:**
-- Builds a rich `dates_description` injecting: destination list, exact/rough date window, season, duration, all preferences, origin country, and group size.
-- Detects `is_rough = not (earliest_possible and latest_possible)`.
-- Runs **`TravelCrews.date_scouting_crew(dates_description).kickoff()`**.
-- **Rough dates:** appends a strict `IMPORTANT` prompt requiring the `Option N: YYYY-MM-DD to YYYY-MM-DD (N days) - rationale` format; `_parse_multiple_date_ranges()` extracts up to 4 windows into `state.proposed_date_options`, first option set as default `confirmed_dates`.
-- **Exact dates:** `_parse_dates_from_text()` extracts the single confirmed range.
+**Parallel per-destination scouting:**
+
+```python
+asyncio.run(
+    TravelCrews.date_scouting_crew().kickoff_for_each_async(inputs=inputs_array)
+)
+```
+
+Each element of `inputs_array` is one destination's input dict:
+
+```python
+{
+  "destination_name": "Tokyo",
+  "date_ctx": "season: summer, duration: 14 days",
+  "pref_context": "moderate budget, solo, origin: India …",
+  "is_rough_instruction": "IMPORTANT: return EXACTLY 3–4 Option N: … lines"
+}
+```
+
+`kickoff_for_each_async` uses `asyncio.create_task` + `asyncio.gather` internally — all N destinations research concurrently, each in its own `asyncio.to_thread(kickoff)` call. `asyncio.run()` is safe here because the flow step runs in a background thread with no running event loop.
+
+**Rough date synthesis:**
+
+After all per-destination scouts finish, a second crew synthesises their reports into up to 4 cross-destination windows:
+
+```python
+TravelCrews.date_synthesis_crew(synthesis_context).kickoff()
+```
+
+The Date Synthesizer agent has no tools — it reasons purely over the combined per-destination reports, requested duration, and user preferences to output exactly 4 `Option N: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale>` lines.
+
+If the LLM output is unparseable, `_find_cross_destination_windows()` runs as a pure-Python fallback: it intersects the per-destination option windows, then slides `requested_days`-length windows across each overlapping region to produce 4 evenly-spaced suggestions of exactly the right duration.
+
+Duration parsing: `_parse_duration_days("2 weeks") → 14`, `"10 days" → 10`, `"1 month" → 30`.
 
 ---
 
 ### Step 1b — `check_date_confirmation` (Human Checkpoint 1)
 
-Decorated with `@listen(analyze_travel_dates)` and `@human_feedback`. The step body broadcasts:
-- `"human_feedback_requested"` with `data.proposed_options[]` (rich option cards for rough dates, or single panel for exact dates).
-- `"flow_state_update"` — updates the status indicator.
+The step body broadcasts:
 
-Then `_request_human_feedback()` (overridden on `TravelPlannerFlow`) calls `wait_for_feedback(session_id)` which blocks on the per-session queue.
+- `"human_feedback_requested"` with `proposed_options[]` (structured `{start, end, duration_days, rationale}` objects for all 4 windows), destination list, and roughness flag.
+- `"flow_state_update"` to update the status indicator.
 
-When the frontend POSTs feedback:
-1. If `body.selected_dates` is present, the feedback endpoint looks up `_active_flows[session_id]` and sets `flow.state.confirmed_dates = body.selected_dates` **before** unblocking the queue.
-2. The Ollama LLM reads the text and emits `"dates_confirmed"` or `"dates_rejected"`.
+Then `_request_human_feedback()` (overridden directly on `TravelPlannerFlow` — uses `self.state.session_id`, safe from any thread) calls `wait_for_feedback(session_id)`, blocking the thread on the per-session `Queue`.
+
+When `POST /api/plan/{id}/feedback` arrives:
+
+1. If `selected_dates` is in the body, `_active_flows[session_id].state.confirmed_dates` is updated first.
+2. `submit_feedback(session_id, text)` puts the text in the queue.
+3. `_collapse_to_outcome()` (also overridden) does a fast substring match against the emit strings — no secondary LLM round-trip needed.
 
 ---
 
 ### Step 2 — `research_destinations` (`@listen("dates_confirmed")`)
 
-Runs **`TravelCrews.destination_research_crew(research_context).kickoff()`**.
+```python
+asyncio.run(
+    TravelCrews.destination_research_crew().kickoff_for_each_async(inputs=inputs_array)
+)
+```
 
-Context string explicitly passes `origin_country` and `group_size` so every tool call is preference-aware. Output stored in `state.agent_outputs["destination_research"]`.
+All N destinations research in parallel. Results are zipped with destination names and joined into a single markdown document with `## DestName` section headers, stored in `state.agent_outputs["destination_research"]`.
 
 ---
 
 ### Step 3 — `plan_logistics` (`@listen(research_destinations)`)
 
-Runs **`TravelCrews.logistics_crew(trip_details).kickoff()`**.
+Single logistics crew invocation. The context string includes:
 
-Context string passes confirmed date range, all preferences, `origin_country`, `group_size`. Output stored in `state.agent_outputs["logistics_plan"]`.
+- Full trip details (dates, preferences, origin).
+- Explicit per-destination day schedule: `"Days 1–3: Paris (3 days)\nDays 4–6: Rome (3 days)…"` — computed by an even split of `duration_days` across destinations, with the remainder distributed to early destinations.
 
 ---
 
@@ -236,200 +292,377 @@ Context string passes confirmed date range, all preferences, `origin_country`, `
 
 **No LLM — pure Python:**
 
-1. Regex `Day N - title\n...content...` splits the logistics output into day blocks.
-2. `_extract_activities()` extracts bullet/numbered lines per day (capped at 6).
-3. Falls back to evenly chunked raw text if structured blocks are absent.
-4. Regex `\$[\d,]+` finds the budget estimate.
-5. Keyword scan (visa, flight, hotel, etc.) extracts up to 8 key logistics lines.
-6. Builds a typed `Itinerary` pydantic object → `state.itinerary`.
-7. Broadcasts `"itinerary_ready"` with the full serialised itinerary JSON.
+1. Regex `(?:Day\s+(\d+))(?:\s*[—\-–]?\s*([^\n]*))` splits the logistics output into day blocks.
+2. `_extract_activities()` extracts bullet/numbered lines per day (max 6).
+3. `_dest_for_day(n)` maps each day number to the correct destination via the same even-split formula used in Step 3.
+4. Falls back to evenly chunked raw text when no structured day blocks are found.
+5. Regex `\$[\d,]+` extracts the budget estimate.
+6. Keyword scan (visa, flight, insurance, hotel, accommodation, transport) extracts up to 8 key logistics lines.
+7. Builds a typed `Itinerary` pydantic object → `state.itinerary`.
+8. Broadcasts `"itinerary_ready"` with the full serialized JSON.
 
 ---
 
 ### Step 5 — `check_user_confirmation` (Human Checkpoint 2)
 
-Triggered by `or_(compile_itinerary, "needs_revision")` — first compile and any revision loop-back. Same `wait_for_feedback` blocking pattern. Ollama emits `"finalize"` or `"needs_revision"`.
+Triggered by `or_(compile_itinerary, "needs_revision")` — fires on **first compile** and on every revision loop-back. Same blocking pattern as Step 1b. `"finalize"` advances; `"needs_revision"` loops back to this same step.
 
 ---
 
 ### Step 6 — `finalize_trip` (`@listen("finalize")`)
 
-- Sets `ui_status = "complete"`.
-- Broadcasts a final `flow_state_update` — UI transitions to the completion screen.
+Sets `ui_status = "complete"`, broadcasts `flow_state_update`.
 
 ---
 
 ## 5. Crew Architecture
 
-Each planning stage is encapsulated in a **`TravelCrews`** factory method. Each method assembles the relevant agents, tasks, and a `Crew` which is then kicked off by the flow step. To extend a stage, add more agents and tasks inside the factory before constructing the `Crew`.
-
 ```
-TravelCrews
-├── date_scouting_crew(context: str) → Crew
-│   └── Agents:  [Date Scout]
-│   └── Process: sequential
+TravelCrews (static factory)
 │
-├── destination_research_crew(context: str) → Crew
-│   └── Agents:  [Destination Expert]
+├── date_scouting_crew() → Crew
+│   └── Agent:   Date Scout  (max_iter=1, max_retry_limit=0)
+│   └── Tools:   analyze_fuzzy_dates, check_travel_seasons, get_flight_availability
 │   └── Process: sequential
+│   └── Usage:   kickoff_for_each_async([{destination_name, date_ctx, …}, …])
+│
+├── date_synthesis_crew(context: str) → Crew
+│   └── Agent:   Date Synthesizer  (max_iter=1, max_retry_limit=0, no tools)
+│   └── Process: sequential
+│   └── Usage:   kickoff() — called once after all scouts complete
+│
+├── destination_research_crew() → Crew
+│   └── Agent:   Destination Expert  (max_iter=1, max_retry_limit=0)
+│   └── Tools:   research_destination, get_visa_requirements, find_accommodations
+│   └── Process: sequential
+│   └── Usage:   kickoff_for_each_async([{destination_name, pref_context}, …])
 │
 └── logistics_crew(context: str) → Crew
-    └── Agents:  [Logistics Manager]
+    └── Agent:   Logistics Manager  (max_iter=1, max_retry_limit=0)
+    └── Tools:   plan_transportation, estimate_budget_breakdown,
+    │            create_daily_itinerary, check_travel_insurance
     └── Process: sequential
+    └── Usage:   kickoff() — called once with full trip context
 ```
 
-### Agents & Their Tools
+All agents: `LLM = ollama/{OLLAMA_MODEL}` · `max_iter = 1` · `max_retry_limit = 0` · `verbose = False`
+
+### Agent Tool Reference
 
 #### Date Scout
-> *Analyze fuzzy dates → return 3-4 ISO date range options (rough) or single range (exact)*
-
-| Tool | Purpose | Key Params |
+| Tool | Purpose | Required inputs |
 |---|---|---|
-| `analyze_fuzzy_dates` | Weather & event research for the date window | `earliest_date`, `latest_date`, `rough_season`, `rough_duration` |
-| `check_travel_seasons` | Forecast for a specific month/period | `timeframe` |
-| `get_flight_availability` | Flight prices, tips, deals | `origin_country`, `group_size`, `budget_level`, `travel_group_type` |
+| `analyze_fuzzy_dates` | Weather & events lookup for the date window | `destination`, date fields from context |
+| `check_travel_seasons` | Seasonal forecast | `destination`, `timeframe` |
+| `get_flight_availability` | Prices, booking tips | `destination`, `origin_country`, `group_size`, `budget_level` |
+
+#### Date Synthesizer
+No tools. Pure reasoning over combined per-destination scout reports + user preferences. Outputs exactly 4 `Option N: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale>` lines.
 
 #### Destination Expert
-> *Research destinations → personalised recommendations*
-
-| Tool | Purpose | Key Params |
+| Tool | Purpose | Required inputs |
 |---|---|---|
-| `research_destination` | Attractions, cuisine, transport, costs | `origin_country`, `group_size` |
-| `get_visa_requirements` | Visa rules by passport | `origin_country` (required) |
-| `find_accommodations` | Hotel/stay options | `group_size`, `travel_pace` |
+| `research_destination` | Attractions, cuisine, transport, costs | `destination`, `origin_country`, `group_size`, all prefs |
+| `get_visa_requirements` | Visa rules by passport | `origin_country`, `destination_country` |
+| `find_accommodations` | Hotel / stay options | `destination`, `group_size`, `budget_level`, `travel_pace` |
 
 #### Logistics Manager
-> *Day-by-day itinerary + full logistics plan*
-
-| Tool | Purpose | Key Params |
+| Tool | Purpose | Required inputs |
 |---|---|---|
-| `plan_transportation` | Flights + local transport | `origin_country`, `group_size` |
-| `estimate_budget_breakdown` | Per-day cost estimates | `group_size` |
-| `create_daily_itinerary` | Activity planner | (all preferences) |
-| `check_travel_insurance` | Insurance options | `origin_country` |
+| `plan_transportation` | Flights + local transport | `origin_country`, `group_size`, all prefs |
+| `estimate_budget_breakdown` | Per-day cost estimates | `destination`, `group_size`, `budget_level` |
+| `create_daily_itinerary` | Activity planner (once per destination) | `destination`, `duration_days`, all prefs |
+| `check_travel_insurance` | Insurance options | `destination`, `origin_country` |
 
-All agents: `LLM = ollama/ministral-3:8b` · `max_iter = 2` · `verbose = False`
+### Thread-Safe Tool Instances
+
+Each tool module (`date_tools.py`, `destination_tools.py`, `logistics_tools.py`) uses `threading.local()` instead of module-level globals for `SerperDevTool` and `ScrapeWebsiteTool`. This ensures each parallel worker thread gets its own tool instance — shared instances caused concurrent `.run()` calls to corrupt each other's internal state.
+
+```python
+_local = threading.local()
+
+def _get_serper():
+    if not hasattr(_local, "serper"):
+        _local.serper = SerperDevTool(n_results=3)  # one per thread
+    return _local.serper
+
+def _get_scraper():
+    if not hasattr(_local, "scraper"):
+        _local.scraper = ScrapeWebsiteTool()
+    return _local.scraper
+```
 
 ---
 
-## 6. Human Feedback System
+## 6. Multi-Destination Parallelism
 
-CrewAI's `@human_feedback` decorator eventually calls `_request_human_feedback()` on the Flow class (which in turn calls `input()`). We override this method directly on `TravelPlannerFlow` to avoid depending on thread-local storage, since CrewAI's `kickoff()` internally uses a `ThreadPoolExecutor` — a different thread than the one `set_thread_session` was called on.
+### Execution Model
 
 ```
-@human_feedback decorator
+analyze_travel_dates / research_destinations
+          │
+          │  asyncio.run(crew.kickoff_for_each_async(inputs))
+          │
+          ▼
+  kickoff_for_each_async (CrewAI 1.11.0)
+    ├─ asyncio.create_task( kickoff_async(crew_copy_1, input_1) )
+    ├─ asyncio.create_task( kickoff_async(crew_copy_2, input_2) )
+    └─ asyncio.create_task( kickoff_async(crew_copy_N, input_N) )
+          │
+          │  asyncio.gather(*tasks)   ← all run concurrently
+          │
+          ▼  each task calls:
+     asyncio.to_thread(crew_copy.kickoff)
+          │
+          ▼
+     ThreadPoolExecutor thread   ← blocking Ollama + Serper calls here
+```
+
+`asyncio.run()` is called from the flow's background thread — there is no running event loop in that thread so this is safe. Results are returned in **input order** regardless of completion order.
+
+### Why `kickoff_for_each` Was Not Enough
+
+`Crew.kickoff_for_each(inputs)` is a plain sequential `for` loop — it offers no parallelism. `kickoff_for_each_async` is the correct API for concurrent execution and was introduced for exactly this use case.
+
+### Date Cross-Destination Synthesis
+
+After all N scouts finish, their raw outputs are combined into a single synthesis context:
+
+```
+=== Date research for Paris ===
+<raw scout output>
+
+=== Date research for Tokyo ===
+<raw scout output>
+```
+
+The synthesizer produces up to 4 combined windows where all destinations align (good weather, acceptable crowd levels, matching user preferences). Each option references every destination by name in its rationale.
+
+**Fallback logic (`_find_cross_destination_windows`):**
+
+1. Intersect per-destination option windows pairwise — keep only regions where all destinations overlap.
+2. Sort overlapping regions longest-first.
+3. For each region, slide N evenly-spaced `requested_days`-long windows across it.
+4. If no inter-destination overlap exists, fall back to the first destination's options with duration enforced.
+
+### Destination Day Schedule
+
+The logistics crew receives an explicit per-destination day allocation:
+
+```
+Days 1–4:  Paris   (4 days)
+Days 5–7:  Rome    (3 days)
+Days 8–10: Berlin  (3 days)
+```
+
+Computed as: `days_per_dest = total_days // n_dests`, remainder distributed to early destinations. `compile_itinerary` uses the same formula via `_dest_for_day(day_num)` to assign the correct destination label to every `ItineraryDay`.
+
+---
+
+## 7. Human Feedback System
+
+```
+@human_feedback decorator → calls _request_human_feedback() on TravelPlannerFlow
         │
         ▼
-TravelPlannerFlow._request_human_feedback(...)  ← overridden
+TravelPlannerFlow._request_human_feedback()   ← overridden (uses self.state.session_id)
         │
         ▼
-_feedback_mod.wait_for_feedback(self.state.session_id)
+_feedback_mod.wait_for_feedback(session_id, timeout=600)
         │
         ▼
 queue.Queue.get(timeout=600)   ← BLOCKS the flow thread
-        ▲
-        │  queue.put_nowait(feedback_text)
+
+        ▲  queue.put_nowait(feedback_text)
+        │
 POST /api/plan/{session_id}/feedback
-  body: { "feedback_text": "...", "selected_dates": {...} }
+  {
+    "feedback_text": "approve option 2",
+    "selected_dates": {           ← optional; applied before unblocking
+      "start_date": "2026-07-01",
+      "end_date":   "2026-07-15",
+      "duration_days": 14
+    }
+  }
         ▲
         │
-  User submits HumanFeedbackCard in React frontend
+  User submits HumanFeedbackCard in the React frontend
 ```
 
-### Feedback module public API (`src/feedback.py`)
+**`_collapse_to_outcome()` override** — bypasses the secondary LLM classification round-trip that CrewAI normally uses to map feedback text to an emit outcome. Instead, a fast exact-then-substring match against the emit strings is used (the frontend always sends the exact outcome token):
+
+```python
+def _collapse_to_outcome(self, feedback, outcomes, llm=None):
+    fb = feedback.strip().lower()
+    for outcome in outcomes:       # exact match first
+        if outcome.lower() == fb:
+            return outcome
+    for outcome in outcomes:       # substring fallback
+        if outcome.lower() in fb:
+            return outcome
+    return outcomes[0]             # default: first = approval path
+```
+
+### Feedback Module Public API (`src/feedback.py`)
 
 | Function | Purpose |
 |---|---|
 | `register_session(id)` | Pre-create the queue slot — call BEFORE spawning the thread |
-| `set_thread_session(id)` | Associate current thread with session (legacy / non-flow callers) |
-| `submit_feedback(id, text)` | Deliver text to the queue — returns True/False |
-| `wait_for_feedback(id, timeout)` | Block current thread until feedback arrives — safe from any thread |
-| `has_pending_slot(id)` | Check if a slot exists and is unfilled |
-| `cleanup_session(id)` | Remove the queue slot — call in thread's `finally` |
+| `set_thread_session(id)` | Associate the current thread with a session ID |
+| `submit_feedback(id, text)` | Deliver text to the waiting queue — returns True/False |
+| `wait_for_feedback(id, timeout)` | Block current thread until feedback arrives |
+| `has_pending_slot(id)` | True if a slot exists and is empty (waiting) |
+| `cleanup_session(id)` | Remove the queue slot — call in thread's finally block |
 
 ---
 
-## 7. Date Option Selection
-
-When the user enters rough/seasonal dates (no exact ISO window), the Date Scout returns **3–4 concrete travel windows** in `Option N:` format. The full end-to-end selection flow:
+## 8. Date Analysis Pipeline
 
 ```
-Backend                              Frontend
-───────                              ────────
-analyze_travel_dates
-  └─ crew output → _parse_multiple_date_ranges()
-  └─ state.proposed_date_options = [3-4 options]
-  └─ state.confirmed_dates = options[0]  (default)
-
-check_date_confirmation
-  └─ _parse_date_options_with_rationale(analysis)
-  └─ broadcast({
-       type: "human_feedback_requested",
-       data: {
-         step: "date_confirmation",
-         proposed_options: [
-           { start, end, duration_days, rationale },
-           ...
-         ]
-       }
-     })
-                                     HumanFeedbackCard
-                                       └─ renders option cards grid
-                                       └─ user clicks a card → selectedIdx
-                                       └─ "Confirm: Jun 2 – Jun 16" button
-
-POST /api/plan/{id}/feedback
-  body: {
-    feedback_text: "approve option 2: ...",
-    selected_dates: { start_date, end_date, duration_days }
-  }
-
-feedback endpoint
-  └─ _active_flows[session_id].state.confirmed_dates = selected_dates
-  └─ submit_feedback(session_id, text)  ← unblocks queue
-```
-
-The `_active_flows` dict maps `session_id → TravelPlannerFlow` and is protected by a `threading.Lock`. This allows the HTTP request handler (on the async event loop) to safely mutate the live flow state before unblocking the queue.
-
----
-
-## 8. Real-Time Event Pipeline
-
-```
-CrewAI Event Bus (global singleton)
-        │
-        │  WebSocketEventListener  (registered at import of src.listeners)
+User input (rough dates + N destinations)
         │
         ▼
-broadcast(data: dict)          ← thread-safe bridge
+date_scouting_crew.kickoff_for_each_async([dest_1, dest_2, …, dest_N])
+        │  (all in parallel)
+        ├─► dest_1 raw output  →  _parse_date_options_with_rationale()
+        │                         per_dest_options["dest_1"] = [{start,end,days,rationale}, …]
+        ├─► dest_2 raw output  →  per_dest_options["dest_2"] = […]
+        └─► dest_N raw output  →  per_dest_options["dest_N"] = […]
         │
-        │  from worker thread?  → asyncio.run_coroutine_threadsafe(loop)
-        │  from event loop?     → asyncio.create_task()
+        ▼
+date_synthesis_crew.kickoff(synthesis_context)
+        │
+        ├─ OUTPUT: up to 4  "Option N: YYYY-MM-DD to YYYY-MM-DD (N days) - rationale" lines
+        │
+        │  _parse_date_options_with_rationale(synthesis_raw) → merged_options[]
+        │
+        │  Duration enforcement:
+        │    for opt in merged_options:
+        │        if opt["duration_days"] != requested_days:
+        │            opt["end"] = start + timedelta(days=requested_days)
+        │
+        ├─ FALLBACK (if synthesis output unparseable):
+        │    _find_cross_destination_windows(per_dest_options, requested_days)
+        │      step 1: pairwise window intersection across all destinations
+        │      step 2: slide requested_days windows across each overlap region
+        │
+        ▼
+state.proposed_date_options = [ConfirmedDateRange, …]  (up to 4)
+state.confirmed_dates        = proposed_date_options[0]  (default selection)
+state.agent_outputs["date_options"] = json.dumps(merged_options)
+        │
+        ▼
+check_date_confirmation broadcasts proposed_options[]
+        → HumanFeedbackCard renders up to 4 date option cards
+        → user picks one → frontend POSTs selected_dates
+        → feedback endpoint sets confirmed_dates on live flow.state
+```
+
+---
+
+## 9. Stop & Retry
+
+### Stop Flow
+
+```
+Frontend: user clicks "⛔ Stop Planning"
+        │
+        ▼
+POST /api/plan/{session_id}/stop
+        │
+        ├─ _stopped_sessions.add(session_id)
+        ├─ _feedback_mod.submit_feedback(session_id, "__stop__")  ← unblocks any wait
+        └─ broadcast({ type: "flow_stopped", … })
+        │
+Background thread:
+  ├─ if blocked on wait_for_feedback → queue unblocked with "__stop__"
+  ├─ flow.kickoff() raises or returns
+  ├─ finally: cleanup_session, _active_flows.pop, _stopped_sessions.discard
+  └─ exception handler: was_stopped=True → no flow_error broadcast
+        │
+Frontend WS handler:
+  "flow_stopped" → ui_status = "stopped", pendingFeedback = null
+```
+
+### Retry Flow
+
+```
+Frontend: user clicks "🔄 Retry"
+        │
+        ▼
+retryFlow() hook:
+  1. store.reset()                          ← clears session, thoughts, itinerary
+  2. initializePlan(storeRef.current.lastPlanRequest)  ← re-submits same form data
+        │
+        ▼
+POST /api/events/kickoff  (new session_id, same inputs)
+```
+
+The last form submission is persisted in `useTravelStore.lastPlanRequest` (set by `initializePlan` on every call, preserved through `reset()`). `retryFlow()` reads it via a ref (`storeRef.current`) to avoid stale closure issues.
+
+### Frontend Status Driven Behavior
+
+**Stop button visible** for statuses: `researching`, `awaiting_date_confirmation`, `awaiting_itinerary_confirmation`, `awaiting_user`
+
+**Stop button disabled** (spinner) during: `stopping`
+
+**Retry banner shown** for: `error`, `stopped`
+
+---
+
+## 10. Real-Time Event Pipeline
+
+```
+CrewAI Event Bus (module-level singleton)
+        │
+        │  WebSocketEventListener.setup_listeners()
+        │  (auto-registered when src.listeners is imported)
+        │
+        ▼
+broadcast(data: dict)        ← thread-safe, callable from any thread
+        │
+        │  worker thread? → asyncio.run_coroutine_threadsafe(_send_all, loop)
+        │  event loop?    → asyncio.create_task(_send_all)
         │
         ▼
 _send_all(message: str)
-        ├─► WS client 1  /ws/events
-        ├─► WS client 2
-        └─► ...  (dead sockets silently pruned)
+  for ws in connected_clients:
+      await ws.send_text(message)   ← dead sockets pruned silently
 ```
 
-### WS Event Types Emitted
+The `_main_loop` reference is set during FastAPI lifespan startup via `set_main_loop(asyncio.get_running_loop())`.
+
+### WS Event Types
 
 | Type | Trigger |
 |---|---|
-| `crew_kickoff_started / completed / failed` | Crew lifecycle |
-| `agent_execution_started / completed` | Agent reasoning |
-| `task_started / completed / failed` | Task lifecycle |
-| `tool_usage_started / finished / error` | Tool calls |
-| `llm_call_started / completed / failed` | LLM prompt/response |
-| `flow_method_started / finished / failed` | Flow step lifecycle |
-| `human_feedback_requested` | Human checkpoint reached (data contains payload + `proposed_options`) |
-| `flow_state_update` | `ui_status` changed |
+| `crew_kickoff_started` | Crew begins execution |
+| `crew_kickoff_completed` | Crew finishes successfully |
+| `crew_kickoff_failed` | Crew raises an exception |
+| `agent_execution_started` | Agent reasoning begins |
+| `agent_execution_completed` | Agent reasoning finishes |
+| `task_started` | Task execution begins |
+| `task_completed` | Task finishes |
+| `task_failed` | Task raises an exception |
+| `tool_usage_started` | Tool call begins |
+| `tool_usage_finished` | Tool call returns |
+| `tool_usage_error` | Tool call fails |
+| `llm_call_started` | LLM prompt sent |
+| `llm_call_completed` | LLM response received |
+| `llm_call_failed` | LLM call errors |
+| `llm_call_chunk` | Streaming LLM token |
+| `flow_method_started` | Flow step begins |
+| `flow_method_finished` | Flow step completes |
+| `flow_method_failed` | Flow step raises |
+| `human_feedback_requested` | Human checkpoint reached — carries `proposed_options[]` |
+| `flow_state_update` | `ui_status` or `current_step` changed |
 | `itinerary_ready` | Full itinerary compiled (Step 4) |
+| `flow_stopped` | Stop requested and acknowledged |
+| `flow_error` | Unhandled exception in flow thread |
 
 ---
 
-## 9. Data Model — TravelState
+## 11. Data Model — TravelState
 
 ```
 TravelState  (extends FlowState)
@@ -438,515 +671,125 @@ TravelState  (extends FlowState)
 ├── user_id: Optional[str]
 │
 ├── rough_dates: FuzzyDateRange
-│   ├── rough_season     e.g. "summer"
-│   ├── rough_duration   e.g. "2 weeks"
-│   ├── earliest_possible: Optional[datetime]
-│   └── latest_possible:  Optional[datetime]
+│   ├── rough_season:       Optional[str]   e.g. "summer"
+│   ├── rough_duration:     Optional[str]   e.g. "2 weeks"
+│   ├── earliest_possible:  Optional[datetime]
+│   └── latest_possible:    Optional[datetime]
 │
 ├── destinations: List[DestinationInput]
-│   └── { name, type, priority }
+│   └── { name: str, type: str, priority: int }
 │
 ├── preferences: TravelPreferences
-│   ├── budget_level      budget | moderate | luxury
-│   ├── travel_pace       relaxed | moderate | fast
-│   ├── trip_theme        adventure | cultural | beach | food | ...
-│   ├── travel_group_type solo | couple | family | friends
-│   ├── group_size        int  (number of travelers)
-│   └── origin_country    str  (passport / departure country)
+│   ├── budget_level:       "budget" | "moderate" | "luxury"
+│   ├── travel_pace:        "relaxed" | "moderate" | "fast"
+│   ├── trip_theme:         Optional[str]  e.g. "adventure", "cultural"
+│   ├── travel_group_type:  "solo" | "couple" | "family" | "friends"
+│   ├── group_size:         int
+│   └── origin_country:     str  (passport / departure country)
 │
 ├── confirmed_dates: Optional[ConfirmedDateRange]
-│   ├── start_date: datetime
-│   ├── end_date:   datetime
+│   ├── start_date:    datetime
+│   ├── end_date:      datetime
 │   └── duration_days: int
 │
 ├── proposed_date_options: List[ConfirmedDateRange]
-│   └── populated when rough dates → 3-4 agent-proposed windows
+│   └── up to 4 cross-destination windows (rough dates only)
 │
 ├── agent_outputs: Dict[str, str]
-│   ├── "date_analysis"
-│   ├── "destination_research"
-│   └── "logistics_plan"
+│   ├── "date_analysis"          ← combined per-destination raw scout outputs
+│   ├── "date_synthesis"         ← raw date synthesis crew output
+│   ├── "date_options"           ← json.dumps(merged_options list)
+│   ├── "destination_research"   ← combined per-destination research markdown
+│   └── "logistics_plan"         ← full logistics + day-by-day itinerary text
 │
 ├── itinerary: Optional[Itinerary]
-│   ├── trip_title, destinations, date_range
-│   ├── days: List[ItineraryDay]
-│   │   └── { day_number, date, title, activities[], notes }
-│   ├── summary, estimated_budget
-│   └── key_logistics: List[str]
+│   ├── trip_title:        str
+│   ├── destinations:      List[DestinationInput]
+│   ├── date_range:        ConfirmedDateRange
+│   ├── days:              List[ItineraryDay]
+│   │   └── { day_number, date, title, activities: List[str], notes }
+│   ├── summary:           str
+│   ├── estimated_budget:  Optional[str]
+│   └── key_logistics:     List[str]
 │
-├── ui_status: str       (drives frontend status indicator)
-└── current_step: str    (drives frontend progress timeline)
+├── ui_status:    str   (drives frontend status indicator)
+│   values: pending | researching | awaiting_date_confirmation |
+│           awaiting_itinerary_confirmation | awaiting_user |
+│           finalizing | complete | stopping | stopped | error
+│
+└── current_step: str   (drives frontend progress timeline)
 ```
 
 ---
 
-## 10. API Entry Points
+## 12. API Reference
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Liveness check |
-| `POST` | `/api/events/kickoff` | Start flow → returns `session_id` immediately (non-blocking) |
-| `WS` | `/ws/events` | Real-time event stream (shared across all sessions) |
-| `POST` | `/api/plan/{session_id}/feedback` | Submit human feedback text + optional `selected_dates` |
-| `POST` | `/api/plan/initialize` | Legacy: session init with Redis persistence |
+| `POST` | `/api/events/kickoff` | Start a new flow — returns `{ session_id }` immediately (non-blocking) |
+| `WS` | `/ws/events` | Real-time CrewAI event stream (shared across all active sessions) |
+| `POST` | `/api/plan/{session_id}/feedback` | Submit human feedback to unblock a waiting checkpoint |
+| `POST` | `/api/plan/{session_id}/stop` | Request graceful cancellation of an in-flight flow |
+| `GET` | `/api/plan/{session_id}` | Retrieve persisted session state from Redis |
+| `POST` | `/api/plan/initialize` | Legacy: synchronous init with Redis — not used by the main UI |
 
-### Feedback request body schema
+### Kickoff Body (`POST /api/events/kickoff`)
 
 ```json
 {
-  "feedback_text": "approve option 2: looks great",
+  "rough_dates": {
+    "rough_season": "summer",
+    "rough_duration": "2 weeks"
+  },
+  "destinations": [
+    { "name": "Paris", "type": "city", "priority": 1 },
+    { "name": "Rome",  "type": "city", "priority": 2 }
+  ],
+  "preferences": {
+    "budget_level": "moderate",
+    "travel_pace": "relaxed",
+    "trip_theme": "cultural",
+    "travel_group_type": "couple",
+    "group_size": 2,
+    "origin_country": "India"
+  }
+}
+```
+
+### Feedback Body (`POST /api/plan/{session_id}/feedback`)
+
+```json
+{
+  "feedback_text": "dates_confirmed",
   "selected_dates": {
-    "start_date": "2026-06-14",
-    "end_date":   "2026-06-28",
+    "start_date":    "2026-07-01T00:00:00",
+    "end_date":      "2026-07-15T00:00:00",
     "duration_days": 14
   }
 }
 ```
 
-`selected_dates` is optional — omit for simple approve/reject. When present, the endpoint applies it to `flow.state.confirmed_dates` before unblocking the thread.
+`selected_dates` is optional. When present the endpoint applies it to `flow.state.confirmed_dates` **before** unblocking the queue, so the flow thread immediately has the user's chosen window available.
 
 ---
 
-## 11. Key Design Decisions
+## 13. Key Design Decisions
 
 | Decision | Rationale |
 |---|---|
-| **`TravelCrews` factory class** | Encapsulates agent+task+crew assembly per planning stage; adding agents means editing one method, not the flow |
-| **`Process.sequential` in every crew** | Straightforward single-agent crews today; switching to `hierarchical` later requires only changing this flag |
-| **Background thread, not async** | `Flow.kickoff()` is synchronous/blocking; a thread keeps FastAPI's event loop free |
-| **Single global `/ws/events`** | All sessions share one WS channel; clients filter by `session_id` in each message |
-| **`_request_human_feedback()` override** | CrewAI's `kickoff()` uses a `ThreadPoolExecutor` internally — a different thread than the one `set_thread_session` targets. Overriding the method uses `self.state.session_id` which is available from any thread via the flow instance |
-| **`_active_flows` dict + lock** | Allows the HTTP feedback endpoint to mutate `flow.state.confirmed_dates` before unblocking the queue — essential for preserving the user's date selection |
-| **Date options in `proposed_options[]`** | Structured `{start, end, duration_days, rationale}` format enables rich card UI in the frontend without the frontend needing to parse any text |
-| **`compile_itinerary` is pure Python** | Avoids a 4th LLM call; regex parsing of structured "Day N" output is fast, deterministic, and cheap |
-| **`or_(compile_itinerary, "needs_revision")`** | Makes revision looping explicit; re-runs the review step without re-running expensive research |
-| **Ollama for `@human_feedback` LLM** | Keeps all inference local; classifying "approve/reject" is trivial for a small model |
-| **`max_iter=2` on all agents** | Hard cap prevents runaway tool loops; 2 iterations is enough for search-then-summarise patterns |
-| **Full preference threading** | Every tool receives `origin_country` and `group_size` so web search queries are contextually accurate to the actual traveler |
-
-
----
-
-## Table of Contents
-1. [High-Level Overview](#1-high-level-overview)
-2. [State Machine](#2-state-machine)
-3. [Flow Diagram](#3-flow-diagram)
-4. [Step-by-Step Walkthrough](#4-step-by-step-walkthrough)
-5. [Agents & Their Tools](#5-agents--their-tools)
-6. [Human Feedback System](#6-human-feedback-system)
-7. [Real-Time Event Pipeline](#7-real-time-event-pipeline)
-8. [Data Model — TravelState](#8-data-model--travelstate)
-9. [API Entry Points](#9-api-entry-points)
-10. [Key Design Decisions](#10-key-design-decisions)
-
----
-
-## 1. High-Level Overview
-
-```
-Browser (React)
-    │  POST /api/events/kickoff  ──►  FastAPI (main.py)
-    │                                     │
-    │  WS  /ws/events  ◄── events ────────┤
-    │                                     │
-    │  POST /api/plan/{id}/feedback ──►   │
-    │                                     ▼
-    │                           Background Thread
-    │                           TravelPlannerFlow.kickoff()
-    │                                     │
-    │                          CrewAI Flow State Machine
-    │                    (6 steps · 3 Crews · 2 human checkpoints)
-```
-
-The backend runs a **CrewAI `Flow`** inside a **background thread** so FastAPI's async event loop is never blocked. All progress streams to the browser over a single **WebSocket** at `/ws/events`.
-
----
-
-## 2. State Machine
-
-`TravelState` (a `FlowState` subclass) holds all data and drives the UI status indicator.
-
-| `ui_status` value | Meaning |
-|---|---|
-| `pending` | Session created, flow not yet started |
-| `researching` | Flow is actively running agents |
-| `awaiting_date_confirmation` | Blocked — waiting for human date approval |
-| `awaiting_itinerary_confirmation` | Blocked — waiting for human itinerary review |
-| `awaiting_user` | Itinerary compiled, ready to display |
-| `complete` | Trip plan finalized |
-| `error` | Unrecoverable error |
-
----
-
-## 3. Flow Diagram
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                         TravelPlannerFlow                              │
-│                                                                        │
-│  ┌──────────────────┐                                                  │
-│  │  @start()        │                                                  │
-│  │ initialize_flow  │  Sets ui_status="researching"                    │
-│  └────────┬─────────┘                                                  │
-│           │ @listen(initialize_flow)                                   │
-│           ▼                                                            │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  analyze_travel_dates                                    │          │
-│  │                                                          │          │
-│  │  confirmed_dates already set?                           │          │
-│  │    YES ──► skip agent, return immediately               │          │
-│  │    NO  ──► run DateScout Crew (max_iter=2)              │          │
-│  │              ├─ analyze_fuzzy_dates                      │          │
-│  │              ├─ check_travel_seasons                     │          │
-│  │              └─ get_flight_availability                  │          │
-│  │           regex-parse ISO dates → state.confirmed_dates  │          │
-│  └────────────────────────┬─────────────────────────────────┘          │
-│           │                                                             │
-│           │ @listen(analyze_travel_dates)                               │
-│           │ @human_feedback(emit=["dates_confirmed","dates_rejected"])   │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  check_date_confirmation   🛑 HUMAN CHECKPOINT 1          │          │
-│  │                                                          │          │
-│  │  1. ui_status = "awaiting_date_confirmation"            │          │
-│  │  2. broadcast("human_feedback_requested")  ────────────►│──► WS    │
-│  │  3. patched input() blocks thread on Queue              │          │
-│  │  4. waits for POST /api/plan/{id}/feedback              │          │
-│  │     (10-min timeout → default "approve")                │          │
-│  │                                                          │          │
-│  │  Ollama classifies response ─────────────────────────   │          │
-│  │    "dates_confirmed" ──────────────────────────────┐    │          │
-│  │    "dates_rejected"  (flow stops / retries)        │    │          │
-│  └────────────────────────────────────────────────────┼────┘          │
-│                               @listen("dates_confirmed")│               │
-│                                                        ▼               │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  research_destinations                                   │          │
-│  │                                                          │          │
-│  │  DestExpert Crew (max_iter=2):                           │          │
-│  │    ├─ research_destination (origin_country, group_size,  │          │
-│  │    │    theme, budget, pace)                             │          │
-│  │    ├─ get_visa_requirements (origin_country → dest)      │          │
-│  │    └─ find_accommodations (group_size, pace, budget)     │          │
-│  │                                                          │          │
-│  │  → state.agent_outputs["destination_research"]           │          │
-│  └────────────────────────┬─────────────────────────────────┘          │
-│           │ @listen(research_destinations)                              │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  plan_logistics                                          │          │
-│  │                                                          │          │
-│  │  LogisticsManager Crew (max_iter=2):                     │          │
-│  │    ├─ plan_transportation (origin_country, group_size)   │          │
-│  │    ├─ estimate_budget_breakdown (group_size)             │          │
-│  │    ├─ create_daily_itinerary (pace, theme, group)        │          │
-│  │    └─ check_travel_insurance (origin_country)            │          │
-│  │                                                          │          │
-│  │  → state.agent_outputs["logistics_plan"]                 │          │
-│  └────────────────────────┬─────────────────────────────────┘          │
-│           │ @listen(plan_logistics)                                     │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  compile_itinerary   (pure Python — no LLM)              │          │
-│  │                                                          │          │
-│  │  ├─ regex "Day N" blocks → activities per day            │          │
-│  │  ├─ extract $ budget estimate                            │          │
-│  │  ├─ extract key logistics lines (visa/flight/hotel...)   │          │
-│  │  └─ build Itinerary pydantic object                      │          │
-│  │                                                          │          │
-│  │  broadcast("itinerary_ready")  ────────────────────────►│──► WS    │
-│  └────────────────────────┬─────────────────────────────────┘          │
-│           │                             ◄──── loops back on revision   │
-│           │ @listen(or_(compile_itinerary, "needs_revision"))           │
-│           │ @human_feedback(emit=["finalize","needs_revision"])         │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  check_user_confirmation   🛑 HUMAN CHECKPOINT 2          │          │
-│  │                                                          │          │
-│  │  1. ui_status = "awaiting_itinerary_confirmation"        │          │
-│  │  2. broadcast("human_feedback_requested")  ────────────►│──► WS    │
-│  │  3. patched input() blocks thread                        │          │
-│  │                                                          │          │
-│  │  Ollama classifies response:                             │          │
-│  │    "finalize"        ──────────────────────────────────┐ │          │
-│  │    "needs_revision"  ──► loops back to this step       │ │          │
-│  └────────────────────────────────────────────────────────┼─┘          │
-│                                  @listen("finalize")       │            │
-│                                                            ▼            │
-│  ┌──────────────────────────────────────────────────────────┐          │
-│  │  finalize_trip                                           │          │
-│  │  ui_status = "complete"                                  │          │
-│  │  broadcast("flow_state_update")  ──────────────────────►│──► WS    │
-│  └──────────────────────────────────────────────────────────┘          │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 4. Step-by-Step Walkthrough
-
-### Step 0 — Session Kickoff (`POST /api/events/kickoff`)
-
-1. FastAPI creates a UUID `session_id` and a `TravelState` from the request body.
-2. `feedback_mod.register_session(session_id)` pre-creates a `queue.Queue(maxsize=1)` **before** the thread starts so `input()` has a slot to block on immediately.
-3. A **daemon thread** is spawned. Inside it: `set_thread_session` binds the session ID to Python thread-local storage, then `flow.kickoff()` is called synchronously.
-4. The thread's `finally` block always calls `cleanup_session` to remove the queue.
-5. FastAPI immediately returns `{"status": "started", "session_id": "..."}` — fully non-blocking.
-
----
-
-### Step 1 — `initialize_flow` (`@start`)
-
-- Sets `ui_status = "researching"`, `current_step = "analyzing_dates"`.
-- No agent or LLM work — purely state mutation.
-
----
-
-### Step 1a — `analyze_travel_dates` (`@listen(initialize_flow)`)
-
-**Short-circuit:** If `confirmed_dates` already has a value (user provided exact ISO dates in the form), the agent is skipped entirely.
-
-**Normal path:**
-- Builds a rich `dates_description` injecting: destination list, exact/rough date window, season, duration, all preferences, origin country, and group size.
-- Runs a single-agent **DateScout Crew** (`max_iter=2`).
-- `_parse_dates_from_text()` regex-scans the agent's output for two `YYYY-MM-DD` patterns and populates `confirmed_dates`.
-
----
-
-### Step 1b — `check_date_confirmation` (Human Checkpoint 1)
-
-Decorated with both `@listen(analyze_travel_dates)` and `@human_feedback`. CrewAI executes the step body, then calls `input()` — which is the patched version.
-
-The **patched `input()`**:
-1. Reads `session_id` from thread-local storage.
-2. Finds that session's `queue.Queue`.
-3. Calls `q.get(timeout=600)` — **blocks the flow thread for up to 10 minutes**.
-
-Meanwhile, the step body has already broadcast:
-- `"human_feedback_requested"` — triggers the `HumanFeedbackCard` in the UI.
-- `"flow_state_update"` — updates the status indicator.
-
-When the user submits feedback, `POST /api/plan/{session_id}/feedback` puts the text into the queue. The Ollama LLM reads the text and emits `"dates_confirmed"` or `"dates_rejected"`.
-
----
-
-### Step 2 — `research_destinations` (`@listen("dates_confirmed")`)
-
-Runs the **DestExpert Crew**. The task description explicitly instructs the agent to:
-- Pass `origin_country` to `get_visa_requirements` and `research_destination`.
-- Pass `group_size` to `find_accommodations`.
-
-Output stored in `state.agent_outputs["destination_research"]`.
-
----
-
-### Step 3 — `plan_logistics` (`@listen(research_destinations)`)
-
-Runs the **LogisticsManager Crew**. Task description mandates:
-- `plan_transportation` ← `origin_country`, `group_size`
-- `estimate_budget_breakdown` ← `group_size`
-- `check_travel_insurance` ← `origin_country`
-
-Output stored in `state.agent_outputs["logistics_plan"]`.
-
----
-
-### Step 4 — `compile_itinerary` (`@listen(plan_logistics)`)
-
-**No LLM — pure Python:**
-
-1. Regex `Day N - title\n...content...` splits the logistics output into day blocks.
-2. `_extract_activities()` extracts bullet/numbered lines per day (capped at 6).
-3. Falls back to evenly chunked raw text if structured day blocks are missing.
-4. Regex `\$[\d,]+` finds the budget estimate.
-5. Keyword scan extracts up to 8 key logistics lines (visa, flight, hotel, etc.).
-6. Builds a typed `Itinerary` pydantic object → `state.itinerary`.
-7. Broadcasts `"itinerary_ready"` with the full serialized itinerary JSON.
-
----
-
-### Step 5 — `check_user_confirmation` (Human Checkpoint 2)
-
-Triggered by `or_(compile_itinerary, "needs_revision")` — so it activates on the **first compile** and also whenever the user requests changes (loop-back).
-
-Same blocking pattern as Checkpoint 1. Ollama emits `"finalize"` or `"needs_revision"`. If revision is requested, the `or_` condition re-triggers this same step.
-
----
-
-### Step 6 — `finalize_trip` (`@listen("finalize")`)
-
-- Sets `ui_status = "complete"`.
-- Broadcasts a final `flow_state_update` — UI transitions to the completion screen.
-
----
-
-## 5. Agents & Their Tools
-
-### DateScout Agent
-> *Analyze fuzzy dates → return precise ISO date range*
-
-| Tool | Purpose | Added Params |
-|---|---|---|
-| `analyze_fuzzy_dates` | Weather & event research for the date window | `earliest_date`, `latest_date`, `rough_season`, `rough_duration` |
-| `check_travel_seasons` | Forecast for a specific month/period | `timeframe` |
-| `get_flight_availability` | Flight prices, tips, deals | `origin_country`, `group_size`, `budget_level`, `travel_group_type` |
-
-### DestExpert Agent
-> *Research destinations → personalised recommendations*
-
-| Tool | Purpose | Added Params |
-|---|---|---|
-| `research_destination` | Attractions, cuisine, transport, costs | `origin_country`, `group_size` |
-| `get_visa_requirements` | Visa rules by passport | `origin_country` (required) |
-| `find_accommodations` | Hotel/stay options | `group_size`, `travel_pace` |
-
-### LogisticsManager Agent
-> *Day-by-day itinerary + full logistics plan*
-
-| Tool | Purpose | Added Params |
-|---|---|---|
-| `plan_transportation` | Flights + local transport | `origin_country`, `group_size` |
-| `estimate_budget_breakdown` | Per-day cost estimates | `group_size` |
-| `create_daily_itinerary` | Activity planner | (all preferences) |
-| `check_travel_insurance` | Insurance options | `origin_country` |
-
-All agents: `LLM = ollama/ministral-3:8b` · `max_iter = 2` · `verbose = False`
-
----
-
-## 6. Human Feedback System
-
-The core mechanism is a **monkey-patched `builtins.input()`** installed once at module import time.
-
-```
-import src.feedback       ← patches builtins.input = _patched_input
-
-@human_feedback decorator calls input("prompt...")
-        │
-        ▼
-_patched_input()
-  1. read _local.session_id  (set by set_thread_session inside the thread)
-  2. _queues[session_id]      (created by register_session before thread start)
-  3. q.get(timeout=600)       ← BLOCKS flow thread up to 10 minutes
-        ▲
-        │  q.put_nowait(text)
-POST /api/plan/{session_id}/feedback
-  body: { "feedback_text": "looks good, approve" }
-        ▲
-        │
-  User clicks Approve/Reject in HumanFeedbackCard (React)
-```
-
-After `input()` unblocks and returns the text, the Ollama LLM classifier (specified via `llm=_FEEDBACK_LLM` on the decorator) reads that text and emits the matching outcome token to drive the flow forward.
-
----
-
-## 7. Real-Time Event Pipeline
-
-```
-CrewAI Event Bus (global singleton)
-        │
-        │  WebSocketEventListener  (registered at import of src.listeners)
-        │
-        ▼
-broadcast(data: dict)          ← thread-safe bridge
-        │
-        │  from worker thread?  → asyncio.run_coroutine_threadsafe(loop)
-        │  from event loop?     → asyncio.create_task()
-        │
-        ▼
-_send_all(message: str)
-        ├─► WS client 1  /ws/events
-        ├─► WS client 2
-        └─► ...  (dead sockets silently pruned)
-```
-
-### WS Event Types Emitted
-
-| Type | Trigger |
-|---|---|
-| `crew_kickoff_started / completed / failed` | Crew lifecycle |
-| `agent_execution_started / completed` | Agent reasoning |
-| `task_started / completed / failed` | Task lifecycle |
-| `tool_usage_started / finished / error` | Tool calls |
-| `llm_call_started / completed / failed` | LLM prompt/response |
-| `flow_method_started / finished / failed` | Flow step lifecycle |
-| `human_feedback_requested` | Human checkpoint reached |
-| `flow_state_update` | `ui_status` changed |
-| `itinerary_ready` | Full itinerary compiled (Step 4) |
-
----
-
-## 8. Data Model — TravelState
-
-```
-TravelState  (extends FlowState)
-│
-├── session_id: str
-├── user_id: Optional[str]
-│
-├── rough_dates: FuzzyDateRange
-│   ├── rough_season     e.g. "summer"
-│   ├── rough_duration   e.g. "2 weeks"
-│   ├── earliest_possible: Optional[datetime]
-│   └── latest_possible:  Optional[datetime]
-│
-├── destinations: List[DestinationInput]
-│   └── { name, type, priority }
-│
-├── preferences: TravelPreferences
-│   ├── budget_level      budget | moderate | luxury
-│   ├── travel_pace       relaxed | moderate | fast
-│   ├── trip_theme        adventure | cultural | beach | food | ...
-│   ├── travel_group_type solo | couple | family | friends
-│   ├── group_size        int  (number of travelers)
-│   └── origin_country    str  (passport / departure country)
-│
-├── confirmed_dates: Optional[ConfirmedDateRange]
-│   ├── start_date: datetime
-│   ├── end_date:   datetime
-│   └── duration_days: int
-│
-├── agent_outputs: Dict[str, str]
-│   ├── "date_analysis"
-│   ├── "destination_research"
-│   └── "logistics_plan"
-│
-├── itinerary: Optional[Itinerary]
-│   ├── trip_title, destinations, date_range
-│   ├── days: List[ItineraryDay]
-│   │   └── { day_number, date, title, activities[], notes }
-│   ├── summary, estimated_budget
-│   └── key_logistics: List[str]
-│
-├── ui_status: str       (drives frontend status indicator)
-└── current_step: str    (drives frontend progress timeline)
-```
-
----
-
-## 9. API Entry Points
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Liveness check |
-| `POST` | `/api/events/kickoff` | Start flow → returns `session_id` (non-blocking) |
-| `WS` | `/ws/events` | Real-time event stream (shared across all sessions) |
-| `POST` | `/api/plan/{session_id}/feedback` | Submit human feedback text to unblock flow |
-| `POST` | `/api/plan/initialize` | Legacy: session init with Redis persistence |
-
----
-
-## 10. Key Design Decisions
-
-| Decision | Rationale |
-|---|---|
-| **Background thread, not async** | `Flow.kickoff()` is synchronous/blocking; a thread keeps FastAPI's event loop free |
-| **Single global `/ws/events`** | All sessions share one WS channel; clients filter by `session_id` in each message |
-| **`builtins.input()` monkey-patch** | CrewAI's `@human_feedback` calls `input()` internally; patching is non-invasive — no CrewAI fork needed |
-| **Thread-local `session_id`** | Multiple sessions run concurrently in separate threads; thread-local is the natural way to associate "which queue am I blocking on?" |
-| **compile_itinerary is pure Python** | Avoids a 4th LLM call; regex parsing of structured "Day N" output is fast, deterministic, and cheap |
-| **`or_(compile_itinerary, "needs_revision")`** | Makes revision looping explicit; the same review step re-runs cleanly without re-running the expensive research steps |
-| **Ollama for `@human_feedback` LLM** | Keeps all inference local; classifying "approve/reject" is trivial for a small model |
-| **`max_iter=2` on all agents** | Hard cap prevents runaway tool loops; 2 iterations is enough for search-then-summarise patterns |
-| **Full preference threading** | Every tool now receives `origin_country` and `group_size`, so every web search query is contextually accurate to the actual traveler |
+| **Background daemon thread** | `Flow.kickoff()` is synchronous and blocking; a thread keeps FastAPI's async event loop free for HTTP and WebSocket I/O |
+| **`asyncio.run(kickoff_for_each_async(...))` for parallelism** | `kickoff_for_each` is a sequential `for` loop; `kickoff_for_each_async` uses `asyncio.create_task` + `asyncio.gather` — every destination crew runs concurrently. `asyncio.run()` is safe because the flow thread has no running event loop |
+| **`threading.local()` for tool instances** | `SerperDevTool` and `ScrapeWebsiteTool` are not thread-safe for concurrent `.run()` calls; per-thread instances eliminate cross-destination result corruption |
+| **Separate `date_synthesis_crew` with no-tool agent** | A pure reasoning pass over all per-destination scouting reports produces cross-destination windows that account for every location simultaneously; dedicated crew with no tools avoids unnecessary tool calls in a reasoning-only step |
+| **`_find_cross_destination_windows` fallback** | Deterministic pure-Python window intersection + sliding-window generator ensures the user always gets 4 options of exactly the right duration, even when the LLM produces unparseable output |
+| **`_request_human_feedback()` override on `TravelPlannerFlow`** | CrewAI's `@human_feedback` decorator calls `input()` internally; overriding the method on the Flow class uses `self.state.session_id` — always available, safe from any thread, no reliance on brittle thread-local lookup |
+| **`_collapse_to_outcome()` override** | Eliminates a secondary LLM round-trip to classify feedback text; the frontend sends exact emit outcome strings so a substring match suffices |
+| **`_active_flows` dict + `threading.Lock`** | Lets the HTTP feedback endpoint safely mutate `flow.state.confirmed_dates` on the live flow object before unblocking the queue — preserving the user's date selection across the async/thread boundary |
+| **Stop via `submit_feedback("__stop__")`** | Reuses the existing feedback queue to unblock a waiting `@human_feedback` step without a separate signalling mechanism; `_stopped_sessions` then suppresses the spurious `flow_error` broadcast that would otherwise fire |
+| **`compile_itinerary` is pure Python** | Avoids a 4th per-step LLM call; deterministic regex parsing of the structured "Day N — Dest" output from the logistics agent is fast and cheap |
+| **`or_(compile_itinerary, "needs_revision")`** | Makes the revision loop explicit in the flow DAG; the human review step re-runs without re-running the expensive research or logistics phases |
+| **`max_iter=1`, `max_retry_limit=0` on all agents/tasks** | Prevents runaway tool-call loops and CrewAI's internal retry machinery from stalling indefinitely; one well-prompted pass is sufficient given the prompt engineering in place |
+| **Per-destination day schedule in logistics context** | Explicitly telling the LogisticsManager "Days 1–3: Paris, Days 4–6: Rome" prevents it from defaulting to only the first destination in multi-destination trips |
+| **`agent_outputs["date_options"]` as JSON** | Storing structured `{start, end, duration_days, rationale}` dicts avoids re-parsing text in the confirmation step and guarantees the frontend date cards reflect accurate data |
+| **`lastPlanRequest` in Zustand store** | Persists the original form submission so `retryFlow()` can restart with the exact same inputs without requiring the user to re-submit the form |
