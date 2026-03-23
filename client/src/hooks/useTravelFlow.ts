@@ -43,6 +43,9 @@ export const useTravelFlow = () => {
     destinations: DestinationInput[];
     preferences: TravelPreferences;
     confirmed_dates?: ConfirmedDateRange;
+    trip_description?: string;
+    user_name?: string;
+    user_age?: string;
   }) => {
     store.setLastPlanRequest(data);
     try {
@@ -51,6 +54,9 @@ export const useTravelFlow = () => {
         destinations: data.destinations,
         preferences: data.preferences,
         confirmed_dates: data.confirmed_dates,
+        trip_description: data.trip_description,
+        user_name: data.user_name,
+        user_age: data.user_age,
         user_id: store.user_id,
       };
 

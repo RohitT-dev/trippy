@@ -126,6 +126,9 @@ export interface PlanInitializeRequest {
   preferences: TravelPreferences;
   user_id?: string;
   confirmed_dates?: ConfirmedDateRange;
+  trip_description?: string;
+  user_name?: string;
+  user_age?: string;
 }
 
 export interface FeedbackSubmission {
@@ -136,4 +139,9 @@ export interface FeedbackSubmission {
     end_date: string;
     duration_days: number;
   };
+}
+
+export interface UserProfile {
+  name: string;
+  age: string;
 }

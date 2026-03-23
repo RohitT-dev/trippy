@@ -13,6 +13,7 @@ import {
   ConfirmedDateRange,
   Itinerary,
   HumanFeedbackRequest,
+  UserProfile,
 } from './types';
 
 const DEFAULT_PREFERENCES: TravelPreferences = {
@@ -27,6 +28,8 @@ const DEFAULT_PREFERENCES: TravelPreferences = {
 interface TravelStore extends TravelState {
   // Human-feedback overlay
   pendingFeedback: HumanFeedbackRequest | null;
+  // User profile (persists across trip resets)
+  userProfile: UserProfile | null;
   // Last plan request — used by retryFlow to re-submit without re-filling the form
   lastPlanRequest: {
     rough_dates: FuzzyDateRange;
@@ -37,6 +40,7 @@ interface TravelStore extends TravelState {
   // Actions
   setSessionId: (id: string) => void;
   setUserId: (id: string) => void;
+  setUserProfile: (profile: UserProfile) => void;
   setRoughDates: (dates: FuzzyDateRange) => void;
   setDestinations: (destinations: DestinationInput[]) => void;
   addDestination: (destination: DestinationInput) => void;
@@ -80,6 +84,7 @@ export const useTravelStore = create<TravelStore>()(
   immer((set) => ({
     ...createInitialState(),
     pendingFeedback: null,
+    userProfile: null,
     lastPlanRequest: null,
 
     setSessionId: (id: string) =>
@@ -90,6 +95,11 @@ export const useTravelStore = create<TravelStore>()(
     setUserId: (id: string) =>
       set((state) => {
         state.user_id = id;
+      }),
+
+    setUserProfile: (profile: UserProfile) =>
+      set((state) => {
+        state.userProfile = profile;
       }),
 
     setRoughDates: (dates: FuzzyDateRange) =>
@@ -182,6 +192,6 @@ export const useTravelStore = create<TravelStore>()(
         state.lastPlanRequest = req;
       }),
 
-    reset: () => set({ ...createInitialState(), pendingFeedback: null, lastPlanRequest: null }),
+    reset: () => set((s) => ({ ...s, ...createInitialState(), pendingFeedback: null, lastPlanRequest: null })),
   }))
 );

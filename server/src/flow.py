@@ -362,9 +362,87 @@ class TravelPlannerFlow(Flow[TravelState]):
         """Entry point: Validate inputs and initialize state"""
         logger.info(f"Starting travel planning for session {self.state.session_id}")
         self.state.ui_status = "researching"
-        self.state.current_step = "analyzing_dates"
+        self.state.current_step = "interpreting_trip"
 
     @listen(initialize_flow)
+    def interpret_trip(self) -> None:
+        """Step 0: TripInterpreter reads the user\'s own words and preferences and
+        produces a rich, structured trip outline that every downstream step can use.
+        Skipped when no trip_description was provided.
+        """
+        description = (self.state.trip_description or "").strip()
+        preferences = self.state.preferences
+
+        # Build a compact preference + profile summary
+        profile_parts = []
+        if self.state.user_name:
+            profile_parts.append(self.state.user_name)
+        if self.state.user_age:
+            profile_parts.append(f"age {self.state.user_age}")
+        profile_str = f"Traveller: {', '.join(profile_parts)}. " if profile_parts else ""
+
+        dest_names = ", ".join(d.name for d in self.state.destinations) or "not specified"
+        pref_summary = (
+            f"{profile_str}"
+            f"Destinations: {dest_names}. "
+            f"Theme/interests: {preferences.trip_theme or 'general'}. "
+            f"Budget: {preferences.budget_level}. "
+            f"Pace: {preferences.travel_pace}. "
+            f"Group: {preferences.travel_group_type} of {preferences.group_size}. "
+            f"Origin: {preferences.origin_country or 'not specified'}."
+        )
+
+        if not description:
+            # No NL text — generate a minimal outline from preferences alone so
+            # downstream steps still have an outline to reference.
+            description = (
+                f"A {preferences.travel_pace}-paced, {preferences.budget_level}-budget "
+                f"{preferences.trip_theme or 'general'} trip to {dest_names} "
+                f"for {preferences.travel_group_type} (group of {preferences.group_size})."
+            )
+
+        self.state.agent_thoughts.append(
+            "🗺️ Trip Interpreter: Understanding your trip and building a detailed outline…"
+        )
+        broadcast({
+            "type": "flow_state_update",
+            "session_id": self.state.session_id,
+            "data": {
+                "session_id": self.state.session_id,
+                "ui_status": "researching",
+                "current_step": "interpreting_trip",
+                "message": "Interpreting your trip description…",
+            },
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+
+        def _task_cb(task_output):
+            broadcast({
+                "type": "task_complete",
+                "session_id": self.state.session_id,
+                "data": {
+                    "agent": getattr(task_output, "agent", ""),
+                    "task": (getattr(task_output, "summary", None) or "")[:100],
+                },
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+
+        result = TravelCrews.trip_outline_crew(
+            description=description,
+            pref_summary=pref_summary,
+            task_callback=_task_cb,
+        ).kickoff()
+
+        outline = str(result.raw if hasattr(result, "raw") else result)
+        self.state.trip_outline = outline
+        self.state.agent_outputs["trip_outline"] = outline
+        self.state.current_step = "analyzing_dates"
+        self.state.agent_thoughts.append(
+            "✅ Trip Interpreter: Outline ready — handing off to date scouts and destination researchers."
+        )
+        logger.info("Trip outline produced for session %s", self.state.session_id)
+
+    @listen(interpret_trip)
     def analyze_travel_dates(self) -> dict:
         """Step 1: DateScout runs in parallel for every destination, then
         overlapping windows are intersected to find dates that suit ALL locations.
@@ -414,6 +492,28 @@ class TravelPlannerFlow(Flow[TravelState]):
             f"Pass origin_country='{preferences.origin_country}' and "
             f"group_size={preferences.group_size} to get_flight_availability."
         )
+        if self.state.trip_description:
+            pref_context = (
+                f"Traveller's own words: \"{self.state.trip_description}\"\n"
+                + pref_context
+            )
+        if self.state.user_name or self.state.user_age:
+            profile_line = "Traveller profile: "
+            if self.state.user_name:
+                profile_line += self.state.user_name
+            if self.state.user_age:
+                profile_line += f", age {self.state.user_age}"
+            pref_context = profile_line + ". " + pref_context
+
+        # Inject the structured trip outline produced by interpret_trip so date
+        # scouts have full context about the trip's vibe and ideal date constraints.
+        if self.state.trip_outline:
+            pref_context = (
+                f"=== Trip Outline (use to choose ideal date windows) ===\n"
+                f"{self.state.trip_outline}\n"
+                f"=== End of Trip Outline ===\n\n"
+                + pref_context
+            )
 
         duration_constraint = (
             f"Each option MUST span EXACTLY {requested_days} days "
@@ -451,15 +551,30 @@ class TravelPlannerFlow(Flow[TravelState]):
             f"{'s' if n != 1 else ''} in parallel ({dest_names_str})…"
         )
 
-        # ── Run date scouting in parallel ─────────────────────────────────────
-        # kickoff_for_each_async schedules every input as a separate asyncio task
-        # (asyncio.create_task → asyncio.gather internally) where each task calls
-        # asyncio.to_thread(kickoff) — offloading the blocking LLM/tool calls to
-        # the default ThreadPoolExecutor.  asyncio.run() is safe here because
-        # the flow step executes in a background thread with no running event loop.
-        date_crew_results = asyncio.run(
-            TravelCrews.date_scouting_crew().kickoff_for_each_async(inputs=inputs_array)
-        )
+        # ── Run date scouting in parallel (one Crew instance per destination) ───
+        # Individual Crew instances are used rather than kickoff_for_each_async on
+        # a single shared crew so that after execution each crew.tasks list has its
+        # .output attributes populated.  The synthesis crew then receives those task
+        # objects via Task.context — CrewAI injects their outputs automatically.
+        def _task_cb(task_output):
+            broadcast({
+                "type": "task_complete",
+                "session_id": self.state.session_id,
+                "data": {
+                    "agent": getattr(task_output, "agent", ""),
+                    "task": (getattr(task_output, "summary", None) or "")[:100],
+                },
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+        scouting_crews = [TravelCrews.date_scouting_crew(task_callback=_task_cb) for _ in inputs_array]
+
+        async def _scout_all():
+            return await asyncio.gather(*[
+                asyncio.to_thread(crew.kickoff, inputs=inp)
+                for crew, inp in zip(scouting_crews, inputs_array)
+            ])
+
+        date_crew_results = asyncio.run(_scout_all())
         async_results = [str(r.raw if hasattr(r, 'raw') else r) for r in date_crew_results]
 
         # ── Collect per-destination options ──────────────────────────────────
@@ -501,27 +616,19 @@ class TravelPlannerFlow(Flow[TravelState]):
         dest_name_list = [d.name for d in destinations]
 
         if is_rough and per_dest_raw:
-            # Build synthesis context: per-destination reports + trip constraints
-            duration_line = (
-                f"Requested trip duration: exactly {requested_days} days.\n"
-                if requested_days else ""
-            )
-            dest_reports = "\n\n".join(
-                f"=== Date research for {name} ===\n{raw}"
-                for name, raw in per_dest_raw.items()
-            )
-            synthesis_context = (
-                f"Destinations to cover: {', '.join(dest_name_list)}\n"
-                f"{duration_line}"
-                f"User preferences: {pref_context}\n\n"
-                f"{dest_reports}"
-            )
-
             self.state.agent_thoughts.append(
                 f"🤖 Date Synthesizer: combining results for {', '.join(dest_name_list)}…"
             )
+            # Pass the executed scouting crews directly — the synthesis crew wires
+            # their task outputs as Task.context so no manual string-building needed.
             synthesis_raw = str(
-                TravelCrews.date_synthesis_crew(synthesis_context).kickoff()
+                TravelCrews.date_synthesis_crew(
+                    scouting_crews,
+                    dest_names=dest_name_list,
+                    pref_context=pref_context,
+                    requested_days=requested_days,
+                    task_callback=_task_cb,
+                ).kickoff()
             )
             self.state.agent_outputs["date_synthesis"] = synthesis_raw
 
@@ -674,6 +781,27 @@ class TravelPlannerFlow(Flow[TravelState]):
             f"and research_destination, and group_size={preferences.group_size} to "
             f"find_accommodations. Provide recommendations that match all these preferences."
         )
+        if self.state.trip_description:
+            pref_context = (
+                f"Traveller's own words: \"{self.state.trip_description}\"\n"
+                + pref_context
+            )
+        if self.state.user_name or self.state.user_age:
+            profile_line = "Traveller profile: "
+            if self.state.user_name:
+                profile_line += self.state.user_name
+            if self.state.user_age:
+                profile_line += f", age {self.state.user_age}"
+            pref_context = profile_line + ". " + pref_context
+
+        # Inject the structured trip outline so the destination researcher has full context.
+        if self.state.trip_outline:
+            pref_context = (
+                f"=== Trip Outline ===\n"
+                f"{self.state.trip_outline}\n"
+                f"=== End of Trip Outline ===\n\n"
+                + pref_context
+            )
 
         # One inputs-dict per destination — akickoff_for_each interpolates these
         # into the {destination_name} / {pref_context} placeholders in the task.
@@ -695,8 +823,18 @@ class TravelPlannerFlow(Flow[TravelState]):
 
         # kickoff_for_each_async runs all N destination crews in parallel via
         # asyncio.create_task + asyncio.gather, each offloaded to a thread.
+        def _task_cb(task_output):
+            broadcast({
+                "type": "task_complete",
+                "session_id": self.state.session_id,
+                "data": {
+                    "agent": getattr(task_output, "agent", ""),
+                    "task": (getattr(task_output, "summary", None) or "")[:100],
+                },
+                "timestamp": datetime.utcnow().isoformat(),
+            })
         dest_crew_results = asyncio.run(
-            TravelCrews.destination_research_crew().kickoff_for_each_async(inputs=inputs_array)
+            TravelCrews.destination_research_crew(task_callback=_task_cb).kickoff_for_each_async(inputs=inputs_array)
         )
         async_results = [str(r.raw if hasattr(r, 'raw') else r) for r in dest_crew_results]
 
@@ -758,6 +896,24 @@ class TravelPlannerFlow(Flow[TravelState]):
             f"Group: {preferences.travel_group_type} ({preferences.group_size} traveler(s)), "
             f"Origin country: {preferences.origin_country or 'not specified'}."
         )
+        if self.state.user_name or self.state.user_age:
+            profile_parts = []
+            if self.state.user_name:
+                profile_parts.append(self.state.user_name)
+            if self.state.user_age:
+                profile_parts.append(f"age {self.state.user_age}")
+            trip_details = f"Traveller: {', '.join(profile_parts)}. " + trip_details
+        if self.state.trip_description:
+            trip_details += (
+                f"\n\nTraveller's own description: \"{self.state.trip_description}\""
+                f"\nUse this to understand the spirit and vibe of the trip when crafting the itinerary."
+            )
+        if self.state.trip_outline:
+            trip_details += (
+                f"\n\n=== Pre-built Trip Outline (follow this closely) ===\n"
+                f"{self.state.trip_outline}\n"
+                f"=== End of Trip Outline ==="
+            )
         if dest_schedule:
             trip_details += f"\n\nDestination schedule (plan days in this order):\n{dest_schedule}"
         trip_details += (
@@ -767,7 +923,17 @@ class TravelPlannerFlow(Flow[TravelState]):
             f"day-by-day itinerary that matches these preferences and the confirmed date range."
         )
 
-        result = TravelCrews.logistics_crew(trip_details).kickoff()
+        def _task_cb(task_output):
+            broadcast({
+                "type": "task_complete",
+                "session_id": self.state.session_id,
+                "data": {
+                    "agent": getattr(task_output, "agent", ""),
+                    "task": (getattr(task_output, "summary", None) or "")[:100],
+                },
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+        result = TravelCrews.logistics_crew(trip_details, task_callback=_task_cb).kickoff()
 
         self.state.agent_thoughts.append("✅ Logistics Manager: Created comprehensive itinerary")
         logger.info(f"Logistics planning complete: {result}")

@@ -10,13 +10,14 @@ interface ProgressTimelineProps {
 }
 
 const STEPS = [
-  { id: 'gathering_inputs', label: 'Gathering Inputs', icon: '📝' },
-  { id: 'analyzing_dates', label: 'Analyzing Dates', icon: '📅' },
-  { id: 'researching_destinations', label: 'Researching Destinations', icon: '🌍' },
-  { id: 'planning_logistics', label: 'Planning Logistics', icon: '✈️' },
-  { id: 'awaiting_confirmation', label: 'Ready for Review', icon: '👀' },
-  { id: 'running_agents', label: 'Creating Itinerary', icon: '🤖' },
-  { id: 'itinerary_ready', label: 'Done!', icon: '🎉' },
+  { id: 'gathering_inputs',            label: 'Gathering Inputs',         icon: '📝' },
+  { id: 'interpreting_trip',           label: 'Interpreting Your Trip',   icon: '🗺️' },
+  { id: 'analyzing_dates',             label: 'Analysing Dates',          icon: '📅' },
+  { id: 'researching_destinations',    label: 'Researching Destinations', icon: '🌍' },
+  { id: 'planning_logistics',          label: 'Planning Logistics',       icon: '✈️' },
+  { id: 'awaiting_confirmation',       label: 'Ready for Review',         icon: '👀' },
+  { id: 'running_agents',              label: 'Creating Itinerary',       icon: '🤖' },
+  { id: 'itinerary_ready',             label: 'Done!',                    icon: '🎉' },
 ];
 
 export const ProgressTimeline = ({ status, currentStep }: ProgressTimelineProps) => {

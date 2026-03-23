@@ -7,9 +7,19 @@ export default {
   theme: {
     extend: {
       colors: {
-        primary: '#3b82f6',
-        secondary: '#8b5cf6',
-        accent: '#ec4899',
+        primary: '#0066FF',
+        'primary-dark': '#0052CC',
+        success: '#10B981',
+        warning: '#F59E0B',
+        info: '#3B82F6',
+      },
+      fontFamily: {
+        sans: ['Plus Jakarta Sans', '-apple-system', 'BlinkMacSystemFont', 'sans-serif'],
+        meta: ['Inter', 'sans-serif'],
+      },
+      borderRadius: {
+        DEFAULT: '8px',
+        card: '8px',
       },
     },
   },

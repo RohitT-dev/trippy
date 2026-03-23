@@ -108,6 +108,12 @@ class TravelState(FlowState):
     """
     session_id: str = Field(..., description="Unique session identifier")
     user_id: Optional[str] = Field(default=None, description="User identifier for personalization")
+    trip_description: Optional[str] = Field(
+        default=None,
+        description="Raw natural-language trip description from the user"
+    )
+    user_name: Optional[str] = Field(default=None, description="Traveller's first name")
+    user_age: Optional[str] = Field(default=None, description="Traveller's age")
 
     # User Inputs
     rough_dates: FuzzyDateRange = Field(
@@ -131,6 +137,11 @@ class TravelState(FlowState):
     proposed_date_options: List[ConfirmedDateRange] = Field(
         default_factory=list,
         description="3–4 date window options proposed by DateScout when rough/seasonal dates are given"
+    )
+    # Agent Outputs / intermediate artifacts
+    trip_outline: Optional[str] = Field(
+        default=None,
+        description="Structured trip outline produced by the TripInterpreter before date scouting"
     )
     agent_outputs: Dict[str, str] = Field(
         default_factory=dict,
@@ -183,6 +194,12 @@ class PlanInitializeRequest(BaseModel):
         default=None,
         description="Exact dates if the user already knows their travel window"
     )
+    trip_description: Optional[str] = Field(
+        default=None,
+        description="Raw natural-language trip description typed by the user"
+    )
+    user_name: Optional[str] = Field(default=None, description="Traveller's first name")
+    user_age: Optional[str] = Field(default=None, description="Traveller's age")
 
 
 class PlanConfirmRequest(BaseModel):

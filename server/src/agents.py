@@ -1,6 +1,8 @@
 """CrewAI Agent and Crew Definitions for Travel Planning"""
 
 import os
+from typing import Any, Tuple
+from pydantic import BaseModel
 from crewai import Agent, Task, Crew, LLM
 from crewai import Process
 from crewai.tools import tool
@@ -22,43 +24,168 @@ from .tools.logistics_tools import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Structured output models
+# ---------------------------------------------------------------------------
+
+class DateWindow(BaseModel):
+    start_date: str
+    end_date: str
+    days: int
+    rationale: str
+
+
+class DateSynthesisOutput(BaseModel):
+    options: list[DateWindow]
+
+
+# ---------------------------------------------------------------------------
+# Task guardrails
+# ---------------------------------------------------------------------------
+
+def _validate_four_options(result) -> Tuple[bool, Any]:
+    """Ensure the synthesis task returns exactly 4 date window options."""
+    if result.pydantic and len(result.pydantic.options) == 4:
+        return (True, result)
+    return (False, "Must return exactly 4 date window options.")
+
+
 class TravelAgents:
     """Collection of agents for travel planning"""
 
     @staticmethod
-    def _get_llm():
-        """Get configured LLM based on environment settings"""
+    def _get_llm(tier: str = "standard") -> LLM | None:
+        """Get a configured LLM for the requested capability tier.
+
+        Tiers:
+          fast      - lightweight model for single-tool callers
+          standard  - balanced model for research / logistics agents
+          reasoning - larger / reasoning-optimised model for synthesis & manager agents
+
+        Override Ollama model names via env vars:
+          OLLAMA_MODEL_FAST, OLLAMA_MODEL (standard), OLLAMA_MODEL_REASONING
+        """
         llm_provider = os.getenv("LLM_PROVIDER", "ollama")
-        
+
         if llm_provider == "ollama":
             base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-            model = os.getenv("OLLAMA_MODEL", "ministral-3:8b")
-            return LLM(
-                model=f"ollama/{model}",
-                base_url=base_url
-            )
+            _standard = os.getenv("OLLAMA_MODEL", "ministral-3:8b")
+            models = {
+                "fast":      os.getenv("OLLAMA_MODEL_FAST", "qgranite4:3b"),
+                "standard":  _standard,
+                "reasoning": os.getenv("OLLAMA_MODEL_REASONING", _standard),
+            }
+            model = models.get(tier, _standard)
+            return LLM(model=f"ollama/{model}", base_url=base_url)
         else:
-            # Default to OpenAI if specified
+            # For OpenAI-compatible providers, model selection is handled externally
             return None  # CrewAI will use default OpenAI
 
     @staticmethod
-    def date_scout_agent() -> Agent:
+    def fuzzy_date_analyst_agent() -> Agent:
         """
-        DateScout agent: Specialized in parsing fuzzy dates and finding optimal travel windows.
+        Specialist: parses vague or seasonal date inputs into concrete date windows.
+        Sole tool: analyze_fuzzy_dates.
         """
         return Agent(
-            role="Date Scout",
-            goal="Analyze fuzzy travel dates and convert them to precise date ranges that work for the user's needs",
-            backstory="""You are an expert in understanding vague travel timelines and converting them into
-            concrete dates. You know how to work with seasons, durations, and constraints to find the best
-            possible travel window. You consider weather patterns, seasonal events, and crowd levels.""",
-            tools=[
-                analyze_fuzzy_dates,
-                check_travel_seasons,
-                get_flight_availability
-            ],
-            llm=TravelAgents._get_llm(),
-            max_iter=1,
+            role="Fuzzy Date Analyst",
+            goal=(
+                "Parse vague or seasonal travel date inputs into concrete candidate date windows "
+                "for {destination_name} using real data."
+            ),
+            backstory=(
+                "You are an expert at decoding imprecise travel timelines like 'summer', "
+                "'two weeks in autumn', or 'sometime in Q3'. You use analyze_fuzzy_dates to "
+                "turn these descriptions into concrete date windows backed by real research."
+            ),
+            tools=[analyze_fuzzy_dates],
+            llm=TravelAgents._get_llm("fast"),
+            max_iter=5,
+            inject_date=True,
+            date_format="%Y-%m-%d",
+            cache=True,
+            respect_context_window=True,
+            verbose=False,
+        )
+
+    @staticmethod
+    def travel_season_analyst_agent() -> Agent:
+        """
+        Specialist: evaluates seasonal weather, crowd levels, and events for a destination.
+        Sole tool: check_travel_seasons.
+        """
+        return Agent(
+            role="Travel Season Analyst",
+            goal=(
+                "Research seasonal weather, crowd levels, and events for {destination_name} "
+                "in the relevant travel window."
+            ),
+            backstory=(
+                "You are a destination climate and events specialist who knows peak, shoulder, "
+                "and off-season windows for destinations worldwide. You use check_travel_seasons "
+                "to fetch accurate, up-to-date seasonal intelligence."
+            ),
+            tools=[check_travel_seasons],
+            llm=TravelAgents._get_llm("fast"),
+            max_iter=5,
+            inject_date=True,
+            date_format="%Y-%m-%d",
+            cache=True,
+            respect_context_window=True,
+            verbose=False,
+        )
+
+    @staticmethod
+    def flight_scout_agent() -> Agent:
+        """
+        Specialist: researches flight availability, pricing, and booking tips.
+        Sole tool: get_flight_availability.
+        """
+        return Agent(
+            role="Flight Scout",
+            goal=(
+                "Research flight availability, price ranges, and booking advice for "
+                "travel to {destination_name}."
+            ),
+            backstory=(
+                "You are a flights and routing specialist who knows what routes exist, "
+                "when to book, and what prices travellers should expect. You use "
+                "get_flight_availability and always pass all traveller context so results "
+                "are personalised."
+            ),
+            tools=[get_flight_availability],
+            llm=TravelAgents._get_llm("fast"),
+            max_iter=5,
+            cache=True,
+            respect_context_window=True,
+            verbose=False,
+        )
+
+    @staticmethod
+    def date_scout_manager_agent() -> Agent:
+        """
+        Manager: orchestrates the three date-scouting specialists and synthesises
+        their findings into a concise date-scouting report. No tools — pure reasoning.
+        """
+        return Agent(
+            role="Date Scout Manager",
+            goal=(
+                "Delegate date-research work to the right specialists, then synthesise their "
+                "findings into a concise, well-structured date-scouting report for "
+                "{destination_name}."
+            ),
+            backstory=(
+                "You are a senior travel research manager who leads a team of date-scouting "
+                "specialists. You direct your Fuzzy Date Analyst, Travel Season Analyst, and "
+                "Flight Scout to each do their focused research, then you combine their outputs "
+                "into a clear summary that the downstream planning stages can use directly."
+            ),
+            tools=[],  # orchestrator only — no direct tool calls
+            llm=TravelAgents._get_llm("reasoning"),
+            max_iter=10,
+            inject_date=True,
+            date_format="%Y-%m-%d",
+            respect_context_window=True,
             verbose=False,
         )
 
@@ -78,8 +205,10 @@ class TravelAgents:
                 get_visa_requirements,
                 find_accommodations,
             ],
-            llm=TravelAgents._get_llm(),
-            max_iter=1,
+            llm=TravelAgents._get_llm("standard"),
+            max_iter=5,
+            cache=True,
+            respect_context_window=True,
             verbose=False,
         )
 
@@ -101,8 +230,10 @@ class TravelAgents:
                 create_daily_itinerary,
                 check_travel_insurance,
             ],
-            llm=TravelAgents._get_llm(),
-            max_iter=1,
+            llm=TravelAgents._get_llm("standard"),
+            max_iter=5,
+            cache=True,
+            respect_context_window=True,
             verbose=False,
         )
 
@@ -128,16 +259,45 @@ class TravelAgents:
                 "You are precise with dates and always justify each suggestion clearly."
             ),
             tools=[],  # Pure reasoning — no tool calls needed
-            llm=TravelAgents._get_llm(),
-            max_iter=1,
+            llm=TravelAgents._get_llm("reasoning"),
+            max_iter=5,
+            inject_date=True,
+            date_format="%Y-%m-%d",
+            respect_context_window=True,
             verbose=False,
         )
 
-
-
-# ---------------------------------------------------------------------------
-# Crew factories — one per planning stage
-# ---------------------------------------------------------------------------
+    @staticmethod
+    def trip_interpreter_agent() -> Agent:
+        """
+        TripInterpreter agent: parses the user's natural-language description and
+        preferences into a structured, richly-detailed trip outline.
+        No tools — pure reasoning over the provided context.
+        """
+        return Agent(
+            role="Trip Interpreter",
+            goal=(
+                "Read the traveller\'s own words and stated preferences, then produce a clear, "
+                "structured outline of what this trip should look and feel like: the vibe, "
+                "key experiences, estimated pace per destination, and any implicit needs "
+                "(accessibility, dietary, etc.). This outline will guide every downstream "
+                "planning step."
+            ),
+            backstory=(
+                "You are a master travel consultant who excels at translating vague travel "
+                "dreams into concrete, actionable trip blueprints. You read between the lines "
+                "of a traveller\'s description — picking up on tone, priorities, and unstated "
+                "expectations — and produce structured outlines that set the other planning "
+                "agents up for success."
+            ),
+            tools=[],
+            llm=TravelAgents._get_llm("standard"),
+            max_iter=3,
+            inject_date=True,
+            date_format="%Y-%m-%d",
+            respect_context_window=True,
+            verbose=False,
+        )
 
 class TravelCrews:
     """Factory for travel-planning Crews.
@@ -149,10 +309,62 @@ class TravelCrews:
     """
 
     @staticmethod
-    def date_scouting_crew() -> Crew:
-        """Crew that analyses fuzzy dates and proposes concrete travel windows.
+    def trip_outline_crew(description: str, pref_summary: str, task_callback=None) -> Crew:
+        """Crew that interprets the user\'s natural-language trip description and
+        preferences into a detailed, structured trip outline.
 
-        Designed for parallel execution via ``akickoff_for_each``.
+        Args:
+            description:  Raw NL text the traveller typed.
+            pref_summary: Pre-formatted preference + profile summary string.
+        """
+        interpreter = TravelAgents.trip_interpreter_agent()
+
+        task = Task(
+            description=(
+                f"Traveller\'s own words:\n\"{description}\"\n\n"
+                f"Traveller profile & preferences:\n{pref_summary}\n\n"
+                "Produce a detailed, structured trip outline with the following sections:\n"
+                "1. Trip Vibe & Theme — the overall feel and purpose of the trip (2–3 sentences).\n"
+                "2. Destinations & Highlights — for each destination: key experiences, "
+                "must-do activities, and estimated days appropriate given the pace/budget.\n"
+                "3. Implicit Needs — anything the traveller has implied but not stated "
+                "(dietary preferences, accessibility needs, photography spots, family-friendliness, "
+                "romance-focused experiences, night-life expectations, etc.).\n"
+                "4. Ideal Date Constraints — the season, weather, or event windows that would "
+                "make this trip exceptional for these specific destinations and interests.\n"
+                "5. Budget Sense-check — whether the stated budget is realistic for the "
+                "destinations, group size, and pace described, and any notable caveats.\n\n"
+                "Be specific and opinionated. This outline is used by every downstream agent — "
+                "date scouts, destination researchers, and logistics planners — so the more "
+                "concrete and tailored the better."
+            ),
+            agent=interpreter,
+            max_retry_limit=0,
+            markdown=True,
+            expected_output=(
+                "Structured trip outline with five clearly-labelled sections: "
+                "Trip Vibe & Theme, Destinations & Highlights, Implicit Needs, "
+                "Ideal Date Constraints, and Budget Sense-check."
+            ),
+        )
+
+        return Crew(
+            agents=[interpreter],
+            tasks=[task],
+            process=Process.sequential,
+            cache=True,
+            task_callback=task_callback,
+            verbose=True,
+        )
+
+    @staticmethod
+    def date_scouting_crew(task_callback=None) -> Crew:
+        """Hierarchical crew that analyses travel dates for a single destination.
+
+        Three specialist agents each handle one research dimension; a manager agent
+        orchestrates them and synthesises the final concise report.
+
+        Designed for parallel execution via ``kickoff_for_each_async``.
         Task placeholders (supplied via the inputs dict):
             {destination_name}     – single destination to research, e.g. "Tokyo"
             {date_ctx}             – pre-formatted date context string
@@ -160,73 +372,128 @@ class TravelCrews:
             {is_rough_instruction} – empty string for exact dates; the
                                      "IMPORTANT: return 3–4 options…" block for rough dates
         """
-        date_scout = TravelAgents.date_scout_agent()
+        fuzzy_analyst = TravelAgents.fuzzy_date_analyst_agent()
+        season_analyst = TravelAgents.travel_season_analyst_agent()
+        flight_scout   = TravelAgents.flight_scout_agent()
+        manager        = TravelAgents.date_scout_manager_agent()
 
-        task = Task(
+        fuzzy_task = Task(
             description=(
-                "Analyse travel dates for {destination_name} and determine the best concrete "
-                "travel window.\n\n"
+                "Interpret the travel date input for {destination_name} and identify "
+                "concrete candidate date windows.\n\n"
                 "Date context: {date_ctx}\n"
                 "{pref_context}\n\n"
-                "Use the available tools to look up real weather forecasts and upcoming events "
-                "for {destination_name}.\n"
-                "Follow these rules when calling tools:\n\n"
-                "1. analyze_fuzzy_dates — pass:\n"
-                "   - destination = {destination_name}\n"
-                "   - All date fields present in the date context above:\n"
-                "     exact ISO dates → earliest_date / latest_date\n"
-                "     rough season / duration → rough_season / rough_duration\n\n"
-                "2. check_travel_seasons — pass:\n"
-                "   - destination = {destination_name}\n"
-                "   - timeframe built from the date context above\n"
-                "     (e.g. 'June 2026', 'summer 2026', 'Jun–Jul 2026')\n\n"
-                "3. get_flight_availability — pass:\n"
-                "   - destination = {destination_name}\n"
-                "   - All fields from {pref_context} (origin_country, group_size, "
-                "budget_level, travel_group_type)\n"
-                "   - Exact ISO dates → start_date / end_date; rough dates → date description\n\n"
-                "Derive the best recommended start and end dates solely from web research results.\n"
-                "Factor in: weather conditions, crowd levels, local festivals, and any hard "
-                "date bounds provided.\n\n"
+                "Call analyze_fuzzy_dates with:\n"
+                "- destination = {destination_name}\n"
+                "- Date fields from the date context above:\n"
+                "  rough dates → rough_season / rough_duration\n"
+                "  exact dates → earliest_date / latest_date\n\n"
+                "Return the candidate windows with a brief 2–3 sentence interpretation.\n\n"
                 "{is_rough_instruction}"
             ),
-            agent=date_scout,
+            agent=fuzzy_analyst,
             max_retry_limit=0,
             expected_output=(
-                "If rough/seasonal dates were given — EXACTLY 3–4 date range options for "
-                "{destination_name}:\n"
-                "Option 1: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale>\n"
-                "Option 2: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale>\n"
-                "Option 3: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale>\n"
-                "Option 4: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale>\n"
-                "If exact dates were given — a single confirmed range YYYY-MM-DD to YYYY-MM-DD "
-                "with concise rationale grounded in real web research for {destination_name}."
+                "Candidate date windows for {destination_name} with start/end date ranges "
+                "and a short explanation derived from the fuzzy date analysis."
+            ),
+        )
+
+        season_task = Task(
+            description=(
+                "Research seasonal travel conditions for {destination_name} in the "
+                "relevant travel window.\n\n"
+                "Date context: {date_ctx}\n"
+                "{pref_context}\n\n"
+                "Call check_travel_seasons with:\n"
+                "- destination = {destination_name}\n"
+                "- timeframe derived from the date context "
+                "(e.g. 'June 2026', 'summer 2026', 'Jun–Jul 2026').\n\n"
+                "Report weather patterns, crowd levels, notable events, and whether the "
+                "window is peak / shoulder / off-season for {destination_name}."
+            ),
+            agent=season_analyst,
+            max_retry_limit=0,
+            expected_output=(
+                "Seasonal summary for {destination_name}: weather, crowd levels, key events, "
+                "and peak / shoulder / off-season classification for the relevant window."
+            ),
+        )
+
+        flight_task = Task(
+            description=(
+                "Research flight availability and pricing for travel to {destination_name}.\n\n"
+                "Date context: {date_ctx}\n"
+                "{pref_context}\n\n"
+                "Call get_flight_availability with:\n"
+                "- destination = {destination_name}\n"
+                "- Traveller context from {pref_context}: origin_country, group_size, "
+                "budget_level, travel_group_type.\n"
+                "- Exact ISO dates → start_date / end_date; rough dates → descriptive string.\n\n"
+                "Report available routes, rough price ranges, and booking recommendations."
+            ),
+            agent=flight_scout,
+            max_retry_limit=0,
+            expected_output=(
+                "Flight summary for {destination_name}: route options, price ranges, and "
+                "booking tips tailored to the traveller profile."
             ),
         )
 
         return Crew(
-            agents=[date_scout],
-            tasks=[task],
-            process=Process.sequential,
+            agents=[fuzzy_analyst, season_analyst, flight_scout],
+            tasks=[fuzzy_task, season_task, flight_task],
+            process=Process.hierarchical,
+            manager_agent=manager,
+            cache=True,
+            task_callback=task_callback,
             verbose=True,
         )
 
     @staticmethod
-    def date_synthesis_crew(context: str) -> Crew:
+    def date_synthesis_crew(
+        executed_scouting_crews: list,
+        dest_names: list[str],
+        pref_context: str,
+        requested_days: int | None = None,
+        task_callback=None,
+    ) -> Crew:
         """Crew that synthesises per-destination date-scouting results into
         4 combined travel windows suitable for ALL destinations.
 
+        The synthesis task receives the scouting outputs via CrewAI's native
+        ``Task.context`` mechanism — every task from every executed scouting
+        crew is listed as context so CrewAI injects their outputs automatically.
+
         Args:
-            context: Pre-formatted string containing per-destination raw outputs,
-                     user preferences, requested duration, and destination list.
+            executed_scouting_crews: Crew instances that have already been run
+                                     (``crew.tasks`` have ``.output`` populated).
+            dest_names:   Destination names in the same order as the crews.
+            pref_context: Pre-formatted user-preferences string.
+            requested_days: Exact trip length in days, or None if unspecified.
         """
         synthesizer = TravelAgents.date_synthesizer_agent()
 
+        # Collect all tasks whose outputs are already populated by the scouting
+        # execution.  CrewAI will inject each task.output.raw into the synthesis
+        # task's prompt context block automatically.
+        context_tasks: list = []
+        for crew in executed_scouting_crews:
+            context_tasks.extend(crew.tasks)
+
+        duration_constraint = (
+            f"Each option MUST span EXACTLY {requested_days} days "
+            f"(the user's requested trip duration).\n"
+        ) if requested_days else ""
+
         task = Task(
             description=(
-                f"{context}\n\n"
+                f"Destinations to cover: {', '.join(dest_names)}\n"
+                f"{duration_constraint}"
+                f"User preferences: {pref_context}\n\n"
+                "The date scouting reports for every destination are available in your "
+                "context (injected above by the system). Read them carefully.\n\n"
                 "Your task:\n"
-                "Read the per-destination date reports above carefully. "
                 "Identify up to 4 date windows where the conditions are simultaneously "
                 "good for EVERY destination listed. "
                 "Each window MUST:\n"
@@ -241,7 +508,12 @@ class TravelCrews:
                 "Option 4: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale mentioning every destination>"
             ),
             agent=synthesizer,
+            context=context_tasks,  # ← scouting outputs injected here by CrewAI
+            output_pydantic=DateSynthesisOutput,
+            guardrail=_validate_four_options,
+            guardrail_max_retries=3,
             max_retry_limit=0,
+            markdown=True,
             expected_output=(
                 "Exactly 4 lines in the format:\n"
                 "Option N: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale covering all destinations>"
@@ -252,11 +524,13 @@ class TravelCrews:
             agents=[synthesizer],
             tasks=[task],
             process=Process.sequential,
+            cache=True,
+            task_callback=task_callback,
             verbose=True,
         )
 
     @staticmethod
-    def destination_research_crew() -> Crew:
+    def destination_research_crew(task_callback=None) -> Crew:
         """Crew that researches a single destination.
 
         Designed for parallel execution via ``akickoff_for_each``.
@@ -294,11 +568,13 @@ class TravelCrews:
             agents=[dest_expert],
             tasks=[task],
             process=Process.sequential,
+            cache=True,
+            task_callback=task_callback,
             verbose=True,
         )
 
     @staticmethod
-    def logistics_crew(context: str) -> Crew:
+    def logistics_crew(context: str, task_callback=None) -> Crew:
         """Crew that creates a comprehensive day-by-day itinerary and logistics plan."""
         logistics_manager = TravelAgents.logistics_manager_agent()
 
@@ -332,6 +608,7 @@ class TravelCrews:
             ),
             agent=logistics_manager,
             max_retry_limit=0,
+            markdown=True,
             expected_output=(
                 "Structured day-by-day itinerary (Day 1, Day 2, ...) with timed activities, "
                 "a $ budget estimate, and a key logistics section covering flights, visa, "
@@ -343,5 +620,7 @@ class TravelCrews:
             agents=[logistics_manager],
             tasks=[task],
             process=Process.sequential,
+            cache=True,
+            task_callback=task_callback,
             verbose=True,
         )

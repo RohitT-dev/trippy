@@ -160,6 +160,9 @@ async def kickoff_flow(request: PlanInitializeRequest):
     travel_state = TravelState(
         session_id=session_id,
         user_id=request.user_id,
+        trip_description=request.trip_description,
+        user_name=request.user_name,
+        user_age=request.user_age,
         rough_dates=request.rough_dates,
         destinations=request.destinations,
         preferences=request.preferences,
@@ -230,6 +233,9 @@ async def initialize_plan(request: PlanInitializeRequest):
         travel_state = TravelState(
             session_id=session_id,
             user_id=request.user_id,
+            trip_description=request.trip_description,
+            user_name=request.user_name,
+            user_age=request.user_age,
             rough_dates=request.rough_dates,
             destinations=request.destinations,
             preferences=request.preferences,

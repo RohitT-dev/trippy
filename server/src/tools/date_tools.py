@@ -38,7 +38,7 @@ def _get_scraper() -> ScrapeWebsiteTool:
     return _local.scraper
 
 
-def _search_and_scrape(query: str, max_pages: int = 2) -> str:
+def _search_and_scrape(query: str, max_pages: int = 5) -> str:
     """Search with Serper, then scrape top URLs for full content."""
     serper = _get_serper()
     if serper is None:
