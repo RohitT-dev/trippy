@@ -36,6 +36,11 @@ from src.listeners import connected_clients, set_main_loop
 from src.listeners.websocket_listener import broadcast
 # Import feedback module — patches builtins.input on first import
 import src.feedback as _feedback_mod
+# Auth & database
+from src.auth import init_firebase
+from src.database import init_mongodb, close_mongodb
+from src.users import router as users_router
+from src.auth_routes import router as auth_router
 
 # Registry of in-flight flows keyed by session_id so the feedback endpoint
 # can mutate flow.state (e.g. confirmed_dates) before unblocking the thread.
@@ -87,10 +92,13 @@ async def lifespan(app: FastAPI):
     # schedule coroutines from CrewAI's synchronous worker threads.
     set_main_loop(asyncio.get_running_loop())
     # Startup
+    init_firebase()
+    await init_mongodb()
     await ws_manager.init_redis()
     logger.info("Application started")
     yield
     # Shutdown
+    await close_mongodb()
     await ws_manager.close_redis()
     logger.info("Application shutdown")
 
@@ -111,6 +119,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include user routes
+app.include_router(users_router)
+app.include_router(auth_router)
 
 
 # ============================================================================

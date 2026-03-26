@@ -35,7 +35,7 @@ Browser (React / TypeScript)
     │                               TravelPlannerFlow.kickoff()
     │                                           │
     │                              CrewAI Flow State Machine
-    │                      7 steps · 4 Crews · 2 human checkpoints
+    │                      8 steps · 5 Crews · 2 human checkpoints
     │                      multi-destination parallel execution
 ```
 
@@ -70,9 +70,24 @@ The backend runs a **CrewAI `Flow`** in a **background daemon thread** so FastAP
 │                                                                          │
 │  ┌──────────────────┐                                                    │
 │  │  @start()        │  ui_status = "researching"                         │
-│  │ initialize_flow  │  current_step = "analyzing_dates"                  │
+│  │ initialize_flow  │  current_step = "interpreting_trip"                │
 │  └────────┬─────────┘                                                    │
 │           │ @listen(initialize_flow)                                     │
+│           ▼                                                              │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │  interpret_trip                                              │        │
+│  │                                                              │        │
+│  │  trip_description provided?                                  │        │
+│  │    YES ──► TripInterpreter Agent (no tools, standard LLM)    │        │
+│  │            Input: trip_description + preferences + profile   │        │
+│  │            Output: 5-section structured outline              │        │
+│  │    NO  ──► auto-generate minimal outline from preferences    │        │
+│  │                                                              │        │
+│  │  → state.trip_outline                                        │        │
+│  │  → state.agent_outputs["trip_outline"]                       │        │
+│  │  (outline injected into every downstream step's context)     │        │
+│  └────────────────────────┬─────────────────────────────────────┘        │
+│           │ @listen(interpret_trip)                                       │
 │           ▼                                                              │
 │  ┌──────────────────────────────────────────────────────────────┐        │
 │  │  analyze_travel_dates                                        │        │
@@ -205,21 +220,51 @@ The backend runs a **CrewAI `Flow`** in a **background daemon thread** so FastAP
 
 ### Step 1 — `initialize_flow` (`@start`)
 
-Sets `ui_status = "researching"` and `current_step = "analyzing_dates"`. No crew or LLM work.
+Sets `ui_status = "researching"` and `current_step = "interpreting_trip"`. No crew or LLM work.
 
 ---
 
-### Step 1a — `analyze_travel_dates` (`@listen(initialize_flow)`)
+### Step 1a — `interpret_trip` (`@listen(initialize_flow)`)
+
+The **TripInterpreter** agent (no tools, standard-tier LLM, `max_iter=3`) reads the user's natural-language `trip_description` combined with their structured preferences and produces a 5-section trip outline:
+
+1. **Trip Vibe & Theme** — overall feel and purpose.
+2. **Destinations & Highlights** — key experiences, must-do activities, estimated days per destination.
+3. **Implicit Needs** — dietary, accessibility, photography, nightlife, etc.
+4. **Ideal Date Constraints** — seasons / events that would make the trip exceptional.
+5. **Budget Sense-check** — realism of stated budget vs. destinations and group size.
+
+If no `trip_description` was supplied, a minimal outline is auto-generated from structured preferences alone (no LLM call).
+
+The outline is stored in:
+- `state.trip_outline` — raw markdown text.
+- `state.agent_outputs["trip_outline"]` — same text, keyed for agent output reference.
+
+**Context injection:** This outline is prepended to the `pref_context` string passed to every downstream crew — date scouting, destination research, and logistics — ensuring all agents share a consistent understanding of the trip's vibe, priorities, and constraints.
+
+---
+
+### Step 1b — `analyze_travel_dates` (`@listen(interpret_trip)`)
 
 **Short-circuit:** If `confirmed_dates` is already set (user supplied exact ISO dates), all crews are skipped.
 
 **Parallel per-destination scouting:**
 
+Individual `date_scouting_crew()` instances are created per destination and run concurrently via `asyncio.gather` + `asyncio.to_thread`:
+
 ```python
-asyncio.run(
-    TravelCrews.date_scouting_crew().kickoff_for_each_async(inputs=inputs_array)
-)
+scouting_crews = [TravelCrews.date_scouting_crew() for _ in inputs_array]
+
+async def _scout_all():
+    return await asyncio.gather(*[
+        asyncio.to_thread(crew.kickoff, inputs=inp)
+        for crew, inp in zip(scouting_crews, inputs_array)
+    ])
+
+date_crew_results = asyncio.run(_scout_all())
 ```
+
+Individual Crew instances (rather than `kickoff_for_each_async` on a shared crew) are used so each crew's `.tasks` list retains populated `.output` attributes after execution. The synthesis crew then receives those task objects via `Task.context` — CrewAI injects their outputs automatically.
 
 Each element of `inputs_array` is one destination's input dict:
 
@@ -239,10 +284,15 @@ Each element of `inputs_array` is one destination's input dict:
 After all per-destination scouts finish, a second crew synthesises their reports into up to 4 cross-destination windows:
 
 ```python
-TravelCrews.date_synthesis_crew(synthesis_context).kickoff()
+TravelCrews.date_synthesis_crew(
+    executed_scouting_crews=scouting_crews,
+    dest_names=dest_name_list,
+    pref_context=pref_context,
+    requested_days=requested_days,
+).kickoff()
 ```
 
-The Date Synthesizer agent has no tools — it reasons purely over the combined per-destination reports, requested duration, and user preferences to output exactly 4 `Option N: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale>` lines.
+The synthesis task receives the scouting outputs via CrewAI's native `Task.context` mechanism — every task from every executed scouting crew is listed as context so CrewAI injects their outputs automatically. The Date Synthesizer agent has no tools — it reasons purely over these injected reports, requested duration, and user preferences to output exactly 4 `Option N: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale>` lines.
 
 If the LLM output is unparseable, `_find_cross_destination_windows()` runs as a pure-Python fallback: it intersects the per-destination option windows, then slides `requested_days`-length windows across each overlapping region to produce 4 evenly-spaced suggestions of exactly the right duration.
 
@@ -250,7 +300,7 @@ Duration parsing: `_parse_duration_days("2 weeks") → 14`, `"10 days" → 10`, 
 
 ---
 
-### Step 1b — `check_date_confirmation` (Human Checkpoint 1)
+### Step 1c — `check_date_confirmation` (Human Checkpoint 1)
 
 The step body broadcasts:
 
@@ -305,7 +355,7 @@ Single logistics crew invocation. The context string includes:
 
 ### Step 5 — `check_user_confirmation` (Human Checkpoint 2)
 
-Triggered by `or_(compile_itinerary, "needs_revision")` — fires on **first compile** and on every revision loop-back. Same blocking pattern as Step 1b. `"finalize"` advances; `"needs_revision"` loops back to this same step.
+Triggered by `or_(compile_itinerary, "needs_revision")` — fires on **first compile** and on every revision loop-back. Same blocking pattern as Step 1c. `"finalize"` advances; `"needs_revision"` loops back to this same step.
 
 ---
 
@@ -320,41 +370,62 @@ Sets `ui_status = "complete"`, broadcasts `flow_state_update`.
 ```
 TravelCrews (static factory)
 │
-├── date_scouting_crew() → Crew
-│   └── Agent:   Date Scout  (max_iter=1, max_retry_limit=0)
-│   └── Tools:   analyze_fuzzy_dates, check_travel_seasons, get_flight_availability
+├── trip_outline_crew(description, pref_summary) → Crew
+│   └── Agent:   Trip Interpreter  (max_iter=3, max_retry_limit=0, no tools)
 │   └── Process: sequential
-│   └── Usage:   kickoff_for_each_async([{destination_name, date_ctx, …}, …])
+│   └── Usage:   kickoff() — called once in interpret_trip step
 │
-├── date_synthesis_crew(context: str) → Crew
-│   └── Agent:   Date Synthesizer  (max_iter=1, max_retry_limit=0, no tools)
+├── date_scouting_crew() → Crew
+│   └── Agents:  Fuzzy Date Analyst (max_iter=5), Travel Season Analyst (max_iter=5),
+│   │            Flight Scout (max_iter=5), Date Scout Manager (max_iter=10)
+│   └── Tools:   analyze_fuzzy_dates, check_travel_seasons, get_flight_availability
+│   └── Process: hierarchical (manager orchestrates 3 specialists)
+│   └── Usage:   one instance per destination, all run concurrently via asyncio.gather
+│
+├── date_synthesis_crew(executed_scouting_crews, dest_names, pref_context, requested_days) → Crew
+│   └── Agent:   Date Synthesizer  (max_iter=5, max_retry_limit=0, no tools)
 │   └── Process: sequential
-│   └── Usage:   kickoff() — called once after all scouts complete
+│   └── Usage:   kickoff() — called once after all scouts complete;
+│                receives scouting outputs via Task.context injection
 │
 ├── destination_research_crew() → Crew
-│   └── Agent:   Destination Expert  (max_iter=1, max_retry_limit=0)
+│   └── Agent:   Destination Expert  (max_iter=5, max_retry_limit=0)
 │   └── Tools:   research_destination, get_visa_requirements, find_accommodations
 │   └── Process: sequential
 │   └── Usage:   kickoff_for_each_async([{destination_name, pref_context}, …])
 │
 └── logistics_crew(context: str) → Crew
-    └── Agent:   Logistics Manager  (max_iter=1, max_retry_limit=0)
+    └── Agent:   Logistics Manager  (max_iter=5, max_retry_limit=0)
     └── Tools:   plan_transportation, estimate_budget_breakdown,
     │            create_daily_itinerary, check_travel_insurance
     └── Process: sequential
     └── Usage:   kickoff() — called once with full trip context
 ```
 
-All agents: `LLM = ollama/{OLLAMA_MODEL}` · `max_iter = 1` · `max_retry_limit = 0` · `verbose = False`
+All agents: `verbose = False` · `cache = True` · `respect_context_window = True`
+
+**LLM tiers** (overridable via env vars `OLLAMA_MODEL_FAST`, `OLLAMA_MODEL`, `OLLAMA_MODEL_REASONING`):
+
+| Tier | Default model | Used by |
+|---|---|---|
+| fast | `qgranite4:3b` | Fuzzy Date Analyst, Travel Season Analyst, Flight Scout |
+| standard | `ministral-3:8b` | Trip Interpreter, Destination Expert, Logistics Manager |
+| reasoning | same as standard | Date Synthesizer, Date Scout Manager |
 
 ### Agent Tool Reference
 
-#### Date Scout
-| Tool | Purpose | Required inputs |
-|---|---|---|
-| `analyze_fuzzy_dates` | Weather & events lookup for the date window | `destination`, date fields from context |
-| `check_travel_seasons` | Seasonal forecast | `destination`, `timeframe` |
-| `get_flight_availability` | Prices, booking tips | `destination`, `origin_country`, `group_size`, `budget_level` |
+#### Trip Interpreter
+No tools. Pure reasoning over the user's `trip_description` and preference summary. Produces a 5-section structured outline (Trip Vibe, Destinations & Highlights, Implicit Needs, Ideal Date Constraints, Budget Sense-check) that is injected into every downstream step.
+
+#### Date Scout (Hierarchical Crew)
+Three specialist agents, each with a single tool, orchestrated by a manager:
+
+| Agent | Tool | Purpose | Required inputs |
+|---|---|---|---|
+| Fuzzy Date Analyst | `analyze_fuzzy_dates` | Vague dates → concrete windows | `destination`, date fields from context |
+| Travel Season Analyst | `check_travel_seasons` | Weather, crowds, events | `destination`, `timeframe` |
+| Flight Scout | `get_flight_availability` | Prices, routes, booking tips | `destination`, `origin_country`, `group_size`, `budget_level` |
+| Date Scout Manager | — | Orchestrates above 3 + synthesises report | (no tools — pure reasoning) |
 
 #### Date Synthesizer
 No tools. Pure reasoning over combined per-destination scout reports + user preferences. Outputs exactly 4 `Option N: YYYY-MM-DD to YYYY-MM-DD (N days) - <rationale>` lines.
@@ -669,6 +740,9 @@ TravelState  (extends FlowState)
 │
 ├── session_id: str
 ├── user_id: Optional[str]
+├── trip_description: Optional[str]   (raw NL text from the user)
+├── user_name: Optional[str]          (traveller's first name)
+├── user_age: Optional[str]           (traveller's age)
 │
 ├── rough_dates: FuzzyDateRange
 │   ├── rough_season:       Optional[str]   e.g. "summer"
@@ -695,7 +769,10 @@ TravelState  (extends FlowState)
 ├── proposed_date_options: List[ConfirmedDateRange]
 │   └── up to 4 cross-destination windows (rough dates only)
 │
+├── trip_outline: Optional[str]         (structured outline from TripInterpreter)
+│
 ├── agent_outputs: Dict[str, str]
+│   ├── "trip_outline"           ← structured 5-section trip outline
 │   ├── "date_analysis"          ← combined per-destination raw scout outputs
 │   ├── "date_synthesis"         ← raw date synthesis crew output
 │   ├── "date_options"           ← json.dumps(merged_options list)
@@ -753,7 +830,10 @@ TravelState  (extends FlowState)
     "travel_group_type": "couple",
     "group_size": 2,
     "origin_country": "India"
-  }
+  },
+  "trip_description": "A romantic cultural trip through Europe with lots of food and wine",
+  "user_name": "Rohit",
+  "user_age": "28"
 }
 ```
 
@@ -778,8 +858,10 @@ TravelState  (extends FlowState)
 
 | Decision | Rationale |
 |---|---|
+| **`interpret_trip` step before date scouting** | A structured TripInterpreter outline produced *first* gives every downstream agent (date scouts, destination researchers, logistics planner) a shared understanding of the trip's vibe, priorities, and implicit needs — leading to more consistent and context-aware results |
+| **Trip outline context injection** | The `trip_outline` is prepended to the `pref_context` string passed to every crew, so even if different agents use different LLM tiers they all reason from the same traveller intent |
 | **Background daemon thread** | `Flow.kickoff()` is synchronous and blocking; a thread keeps FastAPI's async event loop free for HTTP and WebSocket I/O |
-| **`asyncio.run(kickoff_for_each_async(...))` for parallelism** | `kickoff_for_each` is a sequential `for` loop; `kickoff_for_each_async` uses `asyncio.create_task` + `asyncio.gather` — every destination crew runs concurrently. `asyncio.run()` is safe because the flow thread has no running event loop |
+| **Per-destination crew instances for date scouting** | Individual `date_scouting_crew()` instances (not `kickoff_for_each_async` on a shared crew) are created per destination so that each crew's `.tasks` list retains populated `.output` attributes — the synthesis crew then receives those via `Task.context` injection |
 | **`threading.local()` for tool instances** | `SerperDevTool` and `ScrapeWebsiteTool` are not thread-safe for concurrent `.run()` calls; per-thread instances eliminate cross-destination result corruption |
 | **Separate `date_synthesis_crew` with no-tool agent** | A pure reasoning pass over all per-destination scouting reports produces cross-destination windows that account for every location simultaneously; dedicated crew with no tools avoids unnecessary tool calls in a reasoning-only step |
 | **`_find_cross_destination_windows` fallback** | Deterministic pure-Python window intersection + sliding-window generator ensures the user always gets 4 options of exactly the right duration, even when the LLM produces unparseable output |
@@ -789,7 +871,7 @@ TravelState  (extends FlowState)
 | **Stop via `submit_feedback("__stop__")`** | Reuses the existing feedback queue to unblock a waiting `@human_feedback` step without a separate signalling mechanism; `_stopped_sessions` then suppresses the spurious `flow_error` broadcast that would otherwise fire |
 | **`compile_itinerary` is pure Python** | Avoids a 4th per-step LLM call; deterministic regex parsing of the structured "Day N — Dest" output from the logistics agent is fast and cheap |
 | **`or_(compile_itinerary, "needs_revision")`** | Makes the revision loop explicit in the flow DAG; the human review step re-runs without re-running the expensive research or logistics phases |
-| **`max_iter=1`, `max_retry_limit=0` on all agents/tasks** | Prevents runaway tool-call loops and CrewAI's internal retry machinery from stalling indefinitely; one well-prompted pass is sufficient given the prompt engineering in place |
+| **`max_iter` tuned per agent role** | `max_iter=5` for most agents (enough for tool use + correction), `max_iter=10` for the Date Scout Manager (orchestrating 3 specialists needs more iterations), `max_iter=3` for the Trip Interpreter (pure reasoning, rarely needs retries). `max_retry_limit=0` on all tasks prevents CrewAI's internal retry machinery from stalling |
 | **Per-destination day schedule in logistics context** | Explicitly telling the LogisticsManager "Days 1–3: Paris, Days 4–6: Rome" prevents it from defaulting to only the first destination in multi-destination trips |
 | **`agent_outputs["date_options"]` as JSON** | Storing structured `{start, end, duration_days, rationale}` dicts avoids re-parsing text in the confirmation step and guarantees the frontend date cards reflect accurate data |
 | **`lastPlanRequest` in Zustand store** | Persists the original form submission so `retryFlow()` can restart with the exact same inputs without requiring the user to re-submit the form |

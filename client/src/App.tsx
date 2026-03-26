@@ -1,15 +1,39 @@
 import { useState } from 'react';
+import { Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { TripChatPage } from './pages/TripChatPage';
 import { PreferencesPage } from './pages/PreferencesPage';
+import { LoginPage } from './pages/LoginPage';
+import { useAuth } from './context/AuthContext';
 import { useTravelStore } from './store/useTravelStore';
 import './App.css';
 
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { user, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <div className="text-slate-400 text-sm font-medium">Loading…</div>
+      </div>
+    );
+  }
+
+  return user ? <>{children}</> : <Navigate to="/login" replace />;
+}
+
 type Page = 'plan' | 'preferences';
 
-function App() {
+function AppShell() {
   const [activePage, setActivePage] = useState<Page>('plan');
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
   const status = useTravelStore((s) => s.ui_status);
   const isPlanning = status !== 'pending' && status !== 'error' && status !== 'stopped' && status !== 'complete';
+
+  const handleLogout = async () => {
+    await logout();
+    navigate('/login');
+  };
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans">
@@ -43,13 +67,20 @@ function App() {
             ))}
           </div>
 
-          {/* Right CTA */}
-          <button
-            onClick={() => setActivePage('plan')}
-            className="px-4 py-2 rounded-lg text-sm font-semibold text-white bg-primary hover:bg-primary-dark active:scale-95 transition-all shadow-sm"
-          >
-            New Trip
-          </button>
+          {/* Right: user info + logout */}
+          <div className="flex items-center gap-3">
+            {user && (
+              <span className="text-xs text-slate-400 hidden sm:inline truncate max-w-[140px]">
+                {user.email}
+              </span>
+            )}
+            <button
+              onClick={handleLogout}
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-500 border border-slate-200 hover:bg-slate-50 transition-colors"
+            >
+              Sign out
+            </button>
+          </div>
         </div>
       </nav>
 
@@ -62,6 +93,22 @@ function App() {
         )}
       </main>
     </div>
+  );
+}
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route
+        path="/*"
+        element={
+          <ProtectedRoute>
+            <AppShell />
+          </ProtectedRoute>
+        }
+      />
+    </Routes>
   );
 }
 

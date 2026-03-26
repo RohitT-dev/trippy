@@ -7,9 +7,13 @@
  *   03  Interests    — multi-select personality / interest chips → trip_theme
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useTravelStore } from '../store/useTravelStore';
+import { useAuth } from '../context/AuthContext';
 import { TravelPreferences } from '../store/types';
+import axios from 'axios';
+
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 // ---------------------------------------------------------------------------
 // Interest chips
@@ -44,6 +48,7 @@ interface Props {
 
 export const PreferencesPage = ({ onDone }: Props) => {
   const store = useTravelStore();
+  const { getToken } = useAuth();
 
   const [name, setName] = useState(store.userProfile?.name ?? '');
   const [age, setAge] = useState(store.userProfile?.age ?? '');
@@ -55,19 +60,53 @@ export const PreferencesPage = ({ onDone }: Props) => {
   );
   const [saved, setSaved] = useState(false);
 
+  // Sync local state from Zustand store (already hydrated by AuthContext on login/refresh)
+  useEffect(() => {
+    const s = useTravelStore.getState();
+    if (s.userProfile?.name) setName(s.userProfile.name);
+    if (s.userProfile?.age) setAge(s.userProfile.age);
+    if (s.preferences) {
+      setPrefs((prev) => ({ ...prev, ...s.preferences }));
+      if (s.preferences.trip_theme) {
+        setSelectedInterests(
+          s.preferences.trip_theme.split(', ').map((t: string) => t.trim()).filter(Boolean)
+        );
+      }
+    }
+  }, []);
+
   const toggleInterest = (n: string) =>
     setSelectedInterests((prev) =>
       prev.includes(n) ? prev.filter((i) => i !== n) : [...prev, n]
     );
 
-  const handleSave = () => {
-    store.setUserProfile({ name, age });
-    store.setPreferences({
+  const handleSave = async () => {
+    const finalPrefs = {
       ...prefs,
       trip_theme: selectedInterests.length > 0 ? selectedInterests.join(', ') : undefined,
-    });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    };
+
+    // Update local Zustand store
+    store.setUserProfile({ name, age });
+    store.setPreferences(finalPrefs);
+
+    // Persist to MongoDB via backend
+    try {
+      const token = await getToken();
+      await axios.post(
+        `${API_BASE}/api/users/preferences`,
+        {
+          user_profile: { name, age },
+          preferences: finalPrefs,
+        },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch {
+      setSaved(false);
+      store.setErrorMessage('Failed to save preferences to server.');
+    }
   };
 
   const isComplete = !!prefs.origin_country.trim();
