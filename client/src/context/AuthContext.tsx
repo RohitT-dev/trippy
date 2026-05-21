@@ -1,8 +1,6 @@
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from 'react';
-import axios from 'axios';
+import { apiClient } from '../services/api';
 import { useTravelStore } from '../store/useTravelStore';
-
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 export interface AuthUser {
   uid: string;
@@ -47,11 +45,9 @@ function loadUser(): AuthUser | null {
 }
 
 /** Fetch saved preferences from MongoDB and hydrate the Zustand store. */
-async function fetchAndApplyPreferences(token: string) {
+async function fetchAndApplyPreferences() {
   try {
-    const res = await axios.get(`${API_BASE}/api/users/preferences`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const res = await apiClient.get('/api/users/preferences');
     if (res.data.found && res.data.data) {
       const d = res.data.data;
       const store = useTravelStore.getState();
@@ -65,8 +61,9 @@ async function fetchAndApplyPreferences(token: string) {
         store.setPreferences({ ...store.preferences, ...d.preferences });
       }
     }
-  } catch {
-    // First-time user or network hiccup — ignore
+  } catch (error) {
+    // First-time user or network hiccup — log for debugging
+    console.debug('Failed to load preferences:', error instanceof Error ? error.message : 'Unknown error');
   }
 }
 
@@ -78,7 +75,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const token = localStorage.getItem(TOKEN_KEY);
     if (token && user) {
-      fetchAndApplyPreferences(token).finally(() => setLoading(false));
+      fetchAndApplyPreferences().finally(() => setLoading(false));
     } else {
       setLoading(false);
     }
@@ -90,21 +87,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     saveSession(data.id_token, data.refresh_token, u);
     setUser(u);
     // Eagerly load preferences right after login/signup
-    await fetchAndApplyPreferences(data.id_token);
+    await fetchAndApplyPreferences();
   }, []);
 
   const signup = useCallback(async (email: string, password: string) => {
-    const { data } = await axios.post(`${API_BASE}/api/auth/signup`, { email, password });
+    const { data } = await apiClient.post('/api/auth/signup', { email, password });
     await handleAuthResponse(data);
   }, [handleAuthResponse]);
 
   const login = useCallback(async (email: string, password: string) => {
-    const { data } = await axios.post(`${API_BASE}/api/auth/login`, { email, password });
+    const { data } = await apiClient.post('/api/auth/login', { email, password });
     await handleAuthResponse(data);
   }, [handleAuthResponse]);
 
   const googleLogin = useCallback(async (idToken: string) => {
-    const { data } = await axios.post(`${API_BASE}/api/auth/google`, { id_token: idToken });
+    const { data } = await apiClient.post('/api/auth/google', { id_token: idToken });
     await handleAuthResponse(data);
   }, [handleAuthResponse]);
 

@@ -2,7 +2,7 @@
 
 import os
 from typing import Any, Tuple
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from crewai import Agent, Task, Crew, LLM
 from crewai import Process
 from crewai.tools import tool
@@ -39,6 +39,74 @@ class DateSynthesisOutput(BaseModel):
     options: list[DateWindow]
 
 
+class FuzzyDateAnalysisOutput(BaseModel):
+    """Structured output from Fuzzy Date Analyst agent."""
+    destination: str
+    candidate_windows: list[DateWindow] = Field(..., description="1-3 windows from tool only")
+    confidence: float = Field(ge=0, le=1, description="Confidence (0-1)")
+    source: str = Field(default="analyze_fuzzy_dates")
+
+
+class SeasonalAnalysisOutput(BaseModel):
+    """Structured output from Travel Season Analyst."""
+    destination: str
+    weather_summary: str
+    crowd_level: str = Field(description="peak, shoulder, or off-season")
+    notable_events: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
+    source: str = Field(default="check_travel_seasons")
+
+
+class FlightOption(BaseModel):
+    route: str
+    airlines: list[str]
+    price_range: str = Field(description="e.g. '$400-600' or 'INSUFFICIENT_DATA'")
+
+
+class FlightScoutOutput(BaseModel):
+    """Structured output from Flight Scout agent."""
+    destination: str
+    flight_options: list[FlightOption]
+    booking_window: str
+    confidence: float = Field(ge=0, le=1)
+    source: str = Field(default="get_flight_availability")
+
+
+class DestinationResearchOutput(BaseModel):
+    """Structured output from Destination Expert agent."""
+    destination: str
+    attractions: list[str] = Field(..., description="From tool data only")
+    activities: list[str]
+    visa_info: str
+    accommodation_summary: str
+    avg_daily_cost: str
+    confidence: float = Field(ge=0, le=1)
+    source: str = Field(default="research_destination")
+
+
+class DayItinerary(BaseModel):
+    day_number: int
+    destination_name: str
+    activities: list[str] = Field(max_items=5, description="Max 5 activities per day")
+
+
+class LogisticsOutput(BaseModel):
+    """Structured output from Logistics Manager agent."""
+    itinerary: list[DayItinerary]
+    estimated_total_budget: str = Field(description="e.g. '$2500'")
+    key_logistics: str
+    confidence: float = Field(ge=0, le=1)
+
+
+class TripOutlineOutput(BaseModel):
+    """Structured output from Trip Interpreter agent."""
+    trip_vibe: str
+    destinations_summary: str
+    implicit_needs: str
+    ideal_date_window: str
+    budget_assessment: str
+
+
 # ---------------------------------------------------------------------------
 # Task guardrails
 # ---------------------------------------------------------------------------
@@ -48,6 +116,55 @@ def _validate_four_options(result) -> Tuple[bool, Any]:
     if result.pydantic and len(result.pydantic.options) == 4:
         return (True, result)
     return (False, "Must return exactly 4 date window options.")
+
+
+def _validate_no_hallucination_flights(result) -> Tuple[bool, Any]:
+    """Ensure Flight Scout only uses tool data, never guesses prices."""
+    if not result.pydantic or not result.pydantic.flight_options:
+        return (False, "No flight options. If tool had no data, output flight_options: []")
+    # Reject vague price estimates
+    for opt in result.pydantic.flight_options:
+        if any(word in opt.price_range.lower() for word in ["guess", "estimate", "probably", "approximately"]):
+            return (False, "Flight prices must come from tool data or say 'INSUFFICIENT_DATA', never guess.")
+    return (True, result)
+
+
+def _validate_logistics_pacing(result) -> Tuple[bool, Any]:
+    """Ensure itineraries have realistic daily pacing (max 5 activities/day)."""
+    if not result.pydantic:
+        return (False, "Invalid output format.")
+    for day in result.pydantic.itinerary:
+        if len(day.activities) > 5:
+            return (False, f"Day {day.day_number} has {len(day.activities)} activities (max 5 allowed).")
+    return (True, result)
+
+
+def _validate_no_budget_hallucination(result) -> Tuple[bool, Any]:
+    """Ensure Trip Interpreter doesn't estimate costs without data."""
+    if not result.pydantic:
+        return (False, "Invalid output format.")
+    # Check budget_assessment for hallucinated price numbers without context
+    budget = result.pydantic.budget_assessment.lower()
+    # Flag vague numerical claims without explicit source
+    if any(pattern in budget for pattern in ["$", "USD", "per day", "per night"]):
+        if "INSUFFICIENT_DATA" not in budget and "tool data" not in budget and "budget breakdown" not in budget:
+            return (False, 
+                "Budget estimates must cite tool data or explicitly say INSUFFICIENT_DATA. "
+                "Trip Interpreter has no tool access — don't estimate costs.")
+    return (True, result)
+
+
+def _validate_destination_pricing_honesty(result) -> Tuple[bool, Any]:
+    """Ensure Destination Expert doesn't hallucinate accommodation costs."""
+    if not result.pydantic:
+        return (False, "Invalid output format.")
+    accom = result.pydantic.accommodation_summary.lower()
+    if any(pattern in accom for pattern in ["$", "USD", "per night", "per room"]):
+        if "INSUFFICIENT_DATA" not in accom and "tool data" not in accom and "find_accommodations" not in accom:
+            return (False,
+                "Accommodation costs must come from find_accommodations tool or say INSUFFICIENT_DATA. "
+                "Don't estimate prices.")
+    return (True, result)
 
 
 class TravelAgents:
@@ -86,26 +203,32 @@ class TravelAgents:
         """
         Specialist: parses vague or seasonal date inputs into concrete date windows.
         Sole tool: analyze_fuzzy_dates.
+        
+        STRICT RULES:
+        - ONLY return dates provided by analyze_fuzzy_dates tool
+        - NEVER generate or invent dates yourself
+        - If tool returns insufficient/no data → explicitly output INSUFFICIENT_DATA
         """
         return Agent(
             role="Fuzzy Date Analyst",
             goal=(
                 "Parse vague or seasonal travel date inputs into concrete candidate date windows "
-                "for {destination_name} using real data."
+                "for {destination_name} using ONLY data from the analyze_fuzzy_dates tool."
             ),
             backstory=(
-                "You are an expert at decoding imprecise travel timelines like 'summer', "
-                "'two weeks in autumn', or 'sometime in Q3'. You use analyze_fuzzy_dates to "
-                "turn these descriptions into concrete date windows backed by real research."
+                "You are an expert at decoding imprecise travel timelines. You ONLY use "
+                "analyze_fuzzy_dates to turn descriptions like 'summer' into concrete date windows. "
+                "You NEVER invent dates or make assumptions."
             ),
             tools=[analyze_fuzzy_dates],
             llm=TravelAgents._get_llm("fast"),
-            max_iter=5,
+            max_iter=2,
             inject_date=True,
             date_format="%Y-%m-%d",
             cache=True,
             respect_context_window=True,
             verbose=False,
+            temperature=0.0,  # ← Deterministic: no creative date invention
         )
 
     @staticmethod
@@ -113,26 +236,32 @@ class TravelAgents:
         """
         Specialist: evaluates seasonal weather, crowd levels, and events for a destination.
         Sole tool: check_travel_seasons.
+        
+        STRICT RULES:
+        - ONLY report facts provided by check_travel_seasons tool
+        - For every claim (weather, events), cite the tool
+        - If data missing → say INSUFFICIENT_DATA, never fabricate
         """
         return Agent(
             role="Travel Season Analyst",
             goal=(
                 "Research seasonal weather, crowd levels, and events for {destination_name} "
-                "in the relevant travel window."
+                "in the relevant travel window using ONLY data from check_travel_seasons."
             ),
             backstory=(
-                "You are a destination climate and events specialist who knows peak, shoulder, "
-                "and off-season windows for destinations worldwide. You use check_travel_seasons "
-                "to fetch accurate, up-to-date seasonal intelligence."
+                "You are a destination climate specialist. You use check_travel_seasons to fetch "
+                "seasonal intelligence. You ONLY report facts from the tool. You NEVER guess weather "
+                "or events."
             ),
             tools=[check_travel_seasons],
             llm=TravelAgents._get_llm("fast"),
-            max_iter=5,
+            max_iter=2,
             inject_date=True,
             date_format="%Y-%m-%d",
             cache=True,
             respect_context_window=True,
             verbose=False,
+            temperature=0.0,  # ← Deterministic: no speculation on weather/events
         )
 
     @staticmethod
@@ -140,25 +269,31 @@ class TravelAgents:
         """
         Specialist: researches flight availability, pricing, and booking tips.
         Sole tool: get_flight_availability.
+        
+        CRITICAL ANTI-HALLUCINATION RULES:
+        - NEVER estimate flight prices without tool data
+        - If tool returns no prices → output price_range: "INSUFFICIENT_DATA"
+        - NEVER say "approximately" or "likely" prices
+        - All data must come from get_flight_availability
         """
         return Agent(
             role="Flight Scout",
             goal=(
-                "Research flight availability, price ranges, and booking advice for "
-                "travel to {destination_name}."
+                "Research flight availability and pricing for {destination_name} "
+                "using ONLY data from get_flight_availability. NEVER guess prices."
             ),
             backstory=(
-                "You are a flights and routing specialist who knows what routes exist, "
-                "when to book, and what prices travellers should expect. You use "
-                "get_flight_availability and always pass all traveller context so results "
-                "are personalised."
+                "You are a flights specialist. You use get_flight_availability to fetch real "
+                "routing and pricing data. You NEVER estimate or hallucinate prices. "
+                "If the tool has no data, you explicitly say so."
             ),
             tools=[get_flight_availability],
             llm=TravelAgents._get_llm("fast"),
-            max_iter=5,
+            max_iter=2,
             cache=True,
             respect_context_window=True,
             verbose=False,
+            temperature=0.0,  # ← Deterministic: zero tolerance for price hallucination
         )
 
     @staticmethod
@@ -166,64 +301,91 @@ class TravelAgents:
         """
         Manager: orchestrates the three date-scouting specialists and synthesises
         their findings into a concise date-scouting report. No tools — pure reasoning.
+        
+        CRITICAL ANTI-HALLUCINATION RULES:
+        - ONLY synthesize findings from the Flight Scout, Fuzzy Analyst, Season Analyst
+        - NEVER add price estimates not provided by Flight Scout
+        - If Flight Scout reports INSUFFICIENT_DATA → pass that through unchanged
+        - NEVER "fill in" missing price data
         """
         return Agent(
             role="Date Scout Manager",
             goal=(
                 "Delegate date-research work to the right specialists, then synthesise their "
                 "findings into a concise, well-structured date-scouting report for "
-                "{destination_name}."
+                "{destination_name}. ONLY report data provided by your specialists."
             ),
             backstory=(
                 "You are a senior travel research manager who leads a team of date-scouting "
                 "specialists. You direct your Fuzzy Date Analyst, Travel Season Analyst, and "
                 "Flight Scout to each do their focused research, then you combine their outputs "
-                "into a clear summary that the downstream planning stages can use directly."
+                "into a clear summary that the downstream planning stages can use directly. "
+                "You NEVER guess or fabricate data — you only synthesize what your team found."
             ),
             tools=[],  # orchestrator only — no direct tool calls
             llm=TravelAgents._get_llm("reasoning"),
-            max_iter=10,
+            max_iter=2,
             inject_date=True,
             date_format="%Y-%m-%d",
             respect_context_window=True,
             verbose=False,
+            temperature=0.0,  # ← Deterministic: no creative synthesis of pricing
         )
 
     @staticmethod
     def destination_expert_agent() -> Agent:
         """
         DestExpert agent: Specialized in destination research and recommendations.
+        
+        CRITICAL ANTI-HALLUCINATION RULES:
+        - NEVER estimate costs, accommodation prices, or activity fees without tool data
+        - For any pricing question → use find_accommodations tool or explicitly say INSUFFICIENT_DATA
+        - NEVER say "typically costs" or "usually runs about" unless tool provided the data
         """
         return Agent(
             role="Destination Expert",
-            goal="Research destinations thoroughly and provide personalized travel recommendations",
+            goal=(
+                "Research destinations thoroughly using ONLY tool data. "
+                "NEVER estimate prices. If tools lack pricing data → explicitly say so."
+            ),
             backstory="""You are a seasoned travel consultant who has visited hundreds of destinations.
             You know the hidden gems, the best activities, visa requirements, cuisine, culture, and logistics
-            for destinations around the world. You tailor recommendations based on travel style and preferences.""",
+            for destinations around the world. You tailor recommendations based on travel style and preferences.
+            When it comes to pricing, you ONLY report what your tools provide. You NEVER guess costs.""",
             tools=[
                 research_destination,
                 get_visa_requirements,
                 find_accommodations,
             ],
             llm=TravelAgents._get_llm("standard"),
-            max_iter=5,
+            max_iter=2,
             cache=True,
             respect_context_window=True,
             verbose=False,
+            temperature=0.0,  # ← Deterministic: prevent price hallucination
         )
 
     @staticmethod
     def logistics_manager_agent() -> Agent:
         """
         LogisticsManager agent: Specialized in planning trip logistics and itineraries.
+        
+        CRITICAL ANTI-HALLUCINATION RULES:
+        - NEVER estimate transportation costs, activity fees, or meal prices without tool data
+        - For budget calculations → ONLY use estimate_budget_breakdown tool results
+        - NEVER say "expect to spend" or "budget roughly X" unless tool data supports it
+        - Estimated totals must cite the tool or explicitly say INSUFFICIENT_DATA
         """
         return Agent(
             role="Logistics Manager",
-            goal="Create comprehensive travel logistics and day-by-day itineraries that maximize experiences within constraints",
+            goal=(
+                "Create comprehensive travel logistics and day-by-day itineraries "
+                "using ONLY tool data for cost estimates. NEVER guess budget numbers."
+            ),
             backstory="""You are a masterful trip planner who excels at optimizing travel logistics, budgets,
             and itineraries. You understand transportation, accommodation, budgeting, and can create detailed
             daily plans that balance activities, rest, and practical considerations. You always prioritize
-            traveler comfort and safety.""",
+            traveler comfort and safety. For any cost estimate, you use estimate_budget_breakdown and NEVER guess.""",
             tools=[
                 plan_transportation,
                 estimate_budget_breakdown,
@@ -231,10 +393,11 @@ class TravelAgents:
                 check_travel_insurance,
             ],
             llm=TravelAgents._get_llm("standard"),
-            max_iter=5,
+            max_iter=2,
             cache=True,
             respect_context_window=True,
             verbose=False,
+            temperature=0.0,  # ← Deterministic: prevent cost hallucination
         )
 
     @staticmethod
@@ -243,6 +406,12 @@ class TravelAgents:
         DateSynthesizer agent: Combines per-destination date analysis results into
         exactly 4 travel windows that work for ALL destinations simultaneously.
         No tools — it reasons purely over the provided context.
+        
+        CRITICAL ANTI-HALLUCINATION RULES:
+        - ONLY synthesize seasonal/weather data, NOT pricing
+        - If any window lacks seasonal data for a destination → mark as UNCERTAIN
+        - NEVER add flight price predictions to the date windows
+        - Price info comes from Flight Scout data — pass it through don't modify
         """
         return Agent(
             role="Date Synthesizer",
@@ -250,21 +419,24 @@ class TravelAgents:
                 "Analyse the date research reports for multiple destinations and produce "
                 "exactly 4 concrete travel date windows that are simultaneously ideal for "
                 "every destination. Each window must match the user's requested trip duration "
-                "and include a rationale that mentions every destination by name."
+                "and include a rationale that mentions every destination by name. "
+                "Focus on seasonal/weather alignment — pricing is separate."
             ),
             backstory=(
                 "You are a senior travel strategist who specialises in multi-destination trip "
                 "planning. You read per-destination seasonal research and identify the windows "
                 "of time where weather, events, and crowds align well across all locations at once. "
-                "You are precise with dates and always justify each suggestion clearly."
+                "You are precise with dates and always justify each suggestion clearly. "
+                "You NEVER attempt to synthesize or predict flight prices — that's the Flight Scout's job."
             ),
             tools=[],  # Pure reasoning — no tool calls needed
             llm=TravelAgents._get_llm("reasoning"),
-            max_iter=5,
+            max_iter=2,
             inject_date=True,
             date_format="%Y-%m-%d",
             respect_context_window=True,
             verbose=False,
+            temperature=0.0,  # ← Deterministic: no price invention during synthesis
         )
 
     @staticmethod
@@ -273,6 +445,11 @@ class TravelAgents:
         TripInterpreter agent: parses the user's natural-language description and
         preferences into a structured, richly-detailed trip outline.
         No tools — pure reasoning over the provided context.
+        
+        CRITICAL ANTI-HALLUCINATION RULES:
+        - Do NOT estimate costs or budgets based on destinations
+        - Budget assessment → focus on feasibility check, NOT price estimation
+        - If you cannot judge a budget without pricing data → say INSUFFICIENT_DATA
         """
         return Agent(
             role="Trip Interpreter",
@@ -281,22 +458,23 @@ class TravelAgents:
                 "structured outline of what this trip should look and feel like: the vibe, "
                 "key experiences, estimated pace per destination, and any implicit needs "
                 "(accessibility, dietary, etc.). This outline will guide every downstream "
-                "planning step."
+                "planning step. Do NOT estimate costs in this phase."
             ),
             backstory=(
                 "You are a master travel consultant who excels at translating vague travel "
                 "dreams into concrete, actionable trip blueprints. You read between the lines "
                 "of a traveller\'s description — picking up on tone, priorities, and unstated "
                 "expectations — and produce structured outlines that set the other planning "
-                "agents up for success."
+                "agents up for success. You focus on vibe and experience — pricing comes later."
             ),
             tools=[],
             llm=TravelAgents._get_llm("standard"),
-            max_iter=3,
+            max_iter=2,
             inject_date=True,
             date_format="%Y-%m-%d",
             respect_context_window=True,
             verbose=False,
+            temperature=0.0,  # ← Deterministic: no budget speculation
         )
 
 class TravelCrews:
@@ -323,28 +501,31 @@ class TravelCrews:
             description=(
                 f"Traveller\'s own words:\n\"{description}\"\n\n"
                 f"Traveller profile & preferences:\n{pref_summary}\n\n"
-                "Produce a detailed, structured trip outline with the following sections:\n"
-                "1. Trip Vibe & Theme — the overall feel and purpose of the trip (2–3 sentences).\n"
-                "2. Destinations & Highlights — for each destination: key experiences, "
-                "must-do activities, and estimated days appropriate given the pace/budget.\n"
-                "3. Implicit Needs — anything the traveller has implied but not stated "
-                "(dietary preferences, accessibility needs, photography spots, family-friendliness, "
-                "romance-focused experiences, night-life expectations, etc.).\n"
-                "4. Ideal Date Constraints — the season, weather, or event windows that would "
-                "make this trip exceptional for these specific destinations and interests.\n"
-                "5. Budget Sense-check — whether the stated budget is realistic for the "
-                "destinations, group size, and pace described, and any notable caveats.\n\n"
-                "Be specific and opinionated. This outline is used by every downstream agent — "
-                "date scouts, destination researchers, and logistics planners — so the more "
-                "concrete and tailored the better."
+                "Produce a BASIC trip outline guide (NOT a plan) that helps other agents understand the trip.\n"
+                "Include ONLY:\n"
+                "1. Trip Vibe — the overall feeling and purpose of the trip (1-2 sentences). What\'s the essence?\n"
+                "2. Destinations Listed — just list the destinations by name.\n"
+                "3. Rough Timeline — how many days total? When (season/rough dates)?\n"
+                "4. Key Preferences — what matters most to this traveller? "
+                "(budget level, travel pace, group type, interests/themes)\n"
+                "5. Special Considerations — any accessibility, dietary, photography, family, or romantic focus?\n\n"
+                "DO NOT include:\n"
+                "- Specific activities or itineraries (that\'s for other agents)\n"
+                "- Detailed research or highlights\n"
+                "- Cost estimates\n\n"
+                "This outline guides date scouts, destination researchers, and logistics planners. "
+                "Keep it concise and factual."
             ),
             agent=interpreter,
+            output_pydantic=TripOutlineOutput,
+            guardrail=_validate_no_budget_hallucination,
+            guardrail_max_retries=2,
             max_retry_limit=0,
             markdown=True,
             expected_output=(
                 "Structured trip outline with five clearly-labelled sections: "
                 "Trip Vibe & Theme, Destinations & Highlights, Implicit Needs, "
-                "Ideal Date Constraints, and Budget Sense-check."
+                "Ideal Date Constraints, and Budget Sense-check (without cost estimates)."
             ),
         )
 
@@ -430,13 +611,18 @@ class TravelCrews:
                 "- Traveller context from {pref_context}: origin_country, group_size, "
                 "budget_level, travel_group_type.\n"
                 "- Exact ISO dates → start_date / end_date; rough dates → descriptive string.\n\n"
-                "Report available routes, rough price ranges, and booking recommendations."
+                "Report available routes, rough price ranges, and booking recommendations.\n\n"
+                "CRITICAL: All price ranges MUST come from get_flight_availability tool. "
+                "If no pricing data, output price_range='INSUFFICIENT_DATA'. NEVER guess prices."
             ),
             agent=flight_scout,
+            output_pydantic=FlightScoutOutput,
+            guardrail=_validate_no_hallucination_flights,
+            guardrail_max_retries=2,
             max_retry_limit=0,
             expected_output=(
-                "Flight summary for {destination_name}: route options, price ranges, and "
-                "booking tips tailored to the traveller profile."
+                "Flight summary for {destination_name}: route options, price ranges "
+                "(from tool data or INSUFFICIENT_DATA), and booking tips tailored to the traveller profile."
             ),
         )
 
@@ -554,9 +740,15 @@ class TravelCrews:
                 "3. find_accommodations — pass: destination={destination_name}, budget_level,\n"
                 "   trip_theme, travel_group_type, group_size, travel_pace.\n\n"
                 "Cover must-see attractions, activities suited to the trip theme, local cuisine,\n"
-                "transport options, and daily cost estimates. Include visa requirements."
+                "transport options, and daily cost estimates. Include visa requirements.\n\n"
+                "CRITICAL: All accommodation pricing MUST come from find_accommodations tool. "
+                "If tool returns insufficient data, explicitly say INSUFFICIENT_DATA rather than "
+                "estimating costs."
             ),
             agent=dest_expert,
+            output_pydantic=DestinationResearchOutput,
+            guardrail=_validate_destination_pricing_honesty,
+            guardrail_max_retries=2,
             max_retry_limit=0,
             expected_output=(
                 "Personalised destination guide for {destination_name} covering attractions, "
@@ -588,12 +780,14 @@ class TravelCrews:
                 "   end_location, duration_days, budget_level, travel_group_type, trip_theme,\n"
                 "   origin_country, group_size.\n\n"
                 "2. estimate_budget_breakdown — pass: destination, duration_days, budget_level,\n"
-                "   group_size, trip_theme.\n\n"
+                "   group_size, trip_theme. ALWAYS use this tool for cost estimates.\n\n"
                 "3. create_daily_itinerary — pass: destination, duration_days, trip_theme,\n"
                 "   travel_pace, travel_group_type, budget_level. For multi-destination trips\n"
                 "   call this tool ONCE PER destination (with that destination's day count).\n\n"
                 "4. check_travel_insurance — pass: destination, trip_duration, budget_level,\n"
                 "   origin_country.\n\n"
+                "CRITICAL: Total budget estimates MUST come from estimate_budget_breakdown tool. "
+                "If insufficient data, explicitly say INSUFFICIENT_DATA. Never guess costs.\n\n"
                 "IMPORTANT for multi-destination trips: follow the Destination schedule in the\n"
                 "context exactly. Label EVERY day heading with the real destination name:\n"
                 "Day 1 — DestinationName\n"
@@ -603,16 +797,19 @@ class TravelCrews:
                 "Day 2 — DestinationName\n"
                 "...using the actual destination name (e.g. Paris, Tokyo) for EVERY day.\n\n"
                 "Also include:\n"
-                "- Estimated total budget with a $ figure\n"
+                "- Estimated total budget with a $ figure (from estimate_budget_breakdown tool)\n"
                 "- Key logistics: flights, visa requirements, recommended accommodation, insurance"
             ),
             agent=logistics_manager,
+            output_pydantic=LogisticsOutput,
+            guardrail=_validate_logistics_pacing,
+            guardrail_max_retries=2,
             max_retry_limit=0,
             markdown=True,
             expected_output=(
                 "Structured day-by-day itinerary (Day 1, Day 2, ...) with timed activities, "
-                "a $ budget estimate, and a key logistics section covering flights, visa, "
-                "accommodation, and insurance."
+                "a $ budget estimate (from estimate_budget_breakdown), and a key logistics section "
+                "covering flights, visa, accommodation, and insurance."
             ),
         )
 

@@ -9,11 +9,8 @@
 
 import { useState, useEffect } from 'react';
 import { useTravelStore } from '../store/useTravelStore';
-import { useAuth } from '../context/AuthContext';
+import { apiClient } from '../services/api';
 import { TravelPreferences } from '../store/types';
-import axios from 'axios';
-
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 // ---------------------------------------------------------------------------
 // Interest chips
@@ -48,7 +45,6 @@ interface Props {
 
 export const PreferencesPage = ({ onDone }: Props) => {
   const store = useTravelStore();
-  const { getToken } = useAuth();
 
   const [name, setName] = useState(store.userProfile?.name ?? '');
   const [age, setAge] = useState(store.userProfile?.age ?? '');
@@ -92,19 +88,18 @@ export const PreferencesPage = ({ onDone }: Props) => {
 
     // Persist to MongoDB via backend
     try {
-      const token = await getToken();
-      await axios.post(
-        `${API_BASE}/api/users/preferences`,
+      await apiClient.post(
+        '/api/users/preferences',
         {
           user_profile: { name, age },
           preferences: finalPrefs,
         },
-        { headers: { Authorization: `Bearer ${token}` } },
       );
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-    } catch {
+    } catch (error) {
       setSaved(false);
+      console.error('Failed to save preferences:', error);
       store.setErrorMessage('Failed to save preferences to server.');
     }
   };
